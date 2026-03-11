@@ -11,22 +11,30 @@ on:
     branches:
       - main
 
+permissions:
+  contents: read
+
 jobs:
   release:
     name: Test › Build › Release
     runs-on: ubuntu-latest
 
     permissions:
-      contents: write # create GitHub releases, push CHANGELOG/package.json
-      issues: write # comment on issues when they're resolved in a release
-      pull-requests: write # comment on PRs when they're included in a release
-      id-token: write # npm provenance attestation (OIDC)
+      contents: write        # create GitHub releases, push CHANGELOG/package.json
+      issues: write          # comment on released issues
+      pull-requests: write   # comment on released PRs
+      id-token: write        # OIDC for trusted npm publishing + provenance
 
     steps:
-      - name: Checkout (full history required by semantic-release)
+      - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "lts/*"
 
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
@@ -42,21 +50,7 @@ jobs:
       - name: Build
         run: bun run build
 
-      - name: Setup Node.js (required for npm publish)
-        uses: actions/setup-node@v4
-        with:
-          node-version: "22"
-          registry-url: "https://registry.npmjs.org"
-
       - name: Release
-        run: |
-          if [ -z "$NPM_TOKEN" ]; then
-            echo "NPM_TOKEN is not set"
-          else
-            echo "$NPM_TOKEN lol"
-            echo $NPM_TOKEN
-          fi
-          npx semantic-release
+        run: npx semantic-release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
