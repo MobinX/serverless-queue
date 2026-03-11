@@ -51,8 +51,8 @@ function makeSelfInvokingQueue(configOverrides: Partial<QueueConfig> = {}) {
   let queue!: MessageQueue<Payload>;
 
   class LoopbackInvoker extends MessageInvoker<Payload> {
-    async invoke(message: QueueMessage<Payload>): Promise<void> {
-      await queue.handle(message);
+    async invoke(messages: QueueMessage<Payload>[]): Promise<void> {
+      await queue.handle(messages);
     }
   }
 
@@ -76,7 +76,7 @@ describe("handle — new message on idle queue", () => {
     const { queue, action } = setup();
     const msg = makeMessage<Payload>({ payload: { value: 1 } });
 
-    await queue.handle(msg);
+    await queue.handle([msg]);
 
     expect(action.executed).toHaveLength(1);
     expect(action.executed[0]!.id).toBe(msg.id);
@@ -106,7 +106,7 @@ describe("handle — new message on idle queue", () => {
       BASE_CONFIG,
     );
 
-    await queue.handle(makeMessage<Payload>({ payload: { value: 1 } }));
+    await queue.handle([makeMessage<Payload>({ payload: { value: 1 } })]);
 
     expect(states).toEqual([
       "write:pending",
@@ -119,7 +119,7 @@ describe("handle — new message on idle queue", () => {
     const { queue, storage } = setup();
     const msg = makeMessage<Payload>({ payload: { value: 1 } });
 
-    await queue.handle(msg);
+    await queue.handle([msg]);
 
     const stored = await storage.readMessage(msg.id);
     expect(stored?.state).toBe("done");
@@ -148,7 +148,7 @@ describe("handle — new message on busy queue", () => {
       state: "processing",
     });
 
-    await queue.handle(msg);
+    await queue.handle([msg]);
 
     expect(action.executed).toHaveLength(0);
     const stored = await storage.readMessage(msg.id);
@@ -172,7 +172,7 @@ describe("handle — new message on busy queue", () => {
       state: "done",
     });
 
-    await queue.handle(msg);
+    await queue.handle([msg]);
 
     expect(action.executed).toHaveLength(1);
   });
@@ -196,7 +196,7 @@ describe("handle — retry / flush message", () => {
       state: "processing",
     });
 
-    await queue.handle(msg);
+    await queue.handle([msg]);
 
     expect(action.executed).toHaveLength(1);
   });
@@ -205,7 +205,7 @@ describe("handle — retry / flush message", () => {
     const { queue, storage } = setup();
     const msg = makeMessage<Payload>({ payload: { value: 1 }, type: "flush" });
 
-    await queue.handle(msg);
+    await queue.handle([msg]);
 
     const stored = await storage.readMessage(msg.id);
     expect(stored?.state).toBe("done");
@@ -242,7 +242,7 @@ describe("drainPending — after success", () => {
       state: "pending",
     });
 
-    await queue.handle(trigger);
+    await queue.handle([trigger]);
     await flushMicrotasks();
 
     expect(invoker.invoked.some((m) => m.id === pending.id)).toBe(true);
@@ -279,7 +279,7 @@ describe("drainPending — after success", () => {
       });
     }
 
-    await queue.handle(trigger);
+    await queue.handle([trigger]);
     await flushMicrotasks();
 
     expect(invoker.invoked).toHaveLength(batchSize);
@@ -288,12 +288,40 @@ describe("drainPending — after success", () => {
   it("does not invoke when there are no pending messages", async () => {
     const { queue, invoker } = setup();
 
-    await queue.handle(
+    await queue.handle([
       makeMessage<Payload>({ payload: { value: 1 }, queueId: "q-empty" }),
-    );
+    ]);
     await flushMicrotasks();
 
     expect(invoker.invoked).toHaveLength(0);
+  });
+
+  it("bulk drainMode fires a single selfInvoke carrying all pending messages", async () => {
+    const batchSize = 3;
+    const { queue, storage, invoker } = setup({ batchSize, drainMode: 'bulk' });
+
+    const trigger = makeMessage<Payload>({
+      payload: { value: 0 },
+      queueId: "q-bulk",
+      createdAt: 0,
+      type: "flush",
+    });
+
+    for (let i = 1; i <= batchSize; i++) {
+      const m = makeMessage<Payload>({ payload: { value: i }, queueId: "q-bulk", createdAt: i * 100 });
+      await storage.writeMessage({
+        id: m.id, queueId: m.queueId, message: JSON.stringify(m),
+        timestamp: m.createdAt, state: "pending",
+      });
+    }
+
+    await queue.handle([trigger]);
+    await flushMicrotasks();
+
+    // One invoke call carrying all 3 messages
+    expect(invoker.invoked).toHaveLength(batchSize);
+    // We can verify all 3 messages are "flush" type
+    expect(invoker.invoked.every(m => m.type === "flush")).toBe(true);
   });
 });
 
@@ -315,7 +343,7 @@ describe("failure path — retry logic", () => {
     );
 
     const msg = makeMessage<Payload>({ id: "fail-msg", payload: { value: 1 } });
-    await queue.handle(msg);
+    await queue.handle([msg]);
     await flushMicrotasks();
 
     expect(invoker.invoked).toHaveLength(1);
@@ -335,9 +363,9 @@ describe("failure path — retry logic", () => {
       BASE_CONFIG,
     );
 
-    await queue.handle(
+    await queue.handle([
       makeMessage<Payload>({ id: "no-retry", payload: { value: 1 } }),
-    );
+    ]);
 
     expect(invoker.invoked).toHaveLength(0);
   });
@@ -354,9 +382,9 @@ describe("failure path — retry logic", () => {
       { ...BASE_CONFIG, maxAttempts: 1 },
     );
 
-    await queue.handle(
+    await queue.handle([
       makeMessage<Payload>({ id: "exhaust", payload: { value: 1 } }),
-    );
+    ]);
 
     // maxAttempts=1 means attempt 0 is the only try — no retry invoke.
     expect(invoker.invoked).toHaveLength(0);
@@ -376,7 +404,7 @@ describe("failure path — retry logic", () => {
     );
 
     const msg = makeMessage<Payload>({ id: "will-fail", payload: { value: 1 } });
-    await queue.handle(msg);
+    await queue.handle([msg]);
 
     expect((await storage.readMessage(msg.id))?.state).toBe("failed");
     expect(strategy.exhausted).toHaveLength(1);
@@ -394,7 +422,7 @@ describe("failure path — retry logic", () => {
     );
 
     const msg = makeMessage<Payload>({ id: "ex-msg", payload: { value: 42 } });
-    await queue.handle(msg);
+    await queue.handle([msg]);
 
     expect(strategy.exhausted[0]!.id).toBe("ex-msg");
     expect(strategy.exhausted[0]!.payload.value).toBe(42);
@@ -418,7 +446,7 @@ describe("failure path — retry logic", () => {
       id: "ex-throws",
       payload: { value: 1 },
     });
-    await queue.handle(msg);
+    await queue.handle([msg]);
 
     // Message must be 'failed' even though onExhausted threw.
     expect((await storage.readMessage(msg.id))?.state).toBe("failed");
@@ -429,7 +457,7 @@ describe("failure path — retry logic", () => {
 // invokeWithRetry
 // ═════════════════════════════════════════════════════════════════════════════
 
-describe("invokeWithRetry", () => {
+describe("selfInvoke", () => {
   it("succeeds on the first attempt with no failures", async () => {
     const { queue, invoker } = setup({ maxAttempts: 3, invokeRetries: 3 });
     const action = new SpyAction<Payload>().failAlways("f");
@@ -441,7 +469,7 @@ describe("invokeWithRetry", () => {
       invokeRetries: 3,
     });
 
-    await q.handle(makeMessage<Payload>({ id: "f", payload: { value: 1 } }));
+    await q.handle([makeMessage<Payload>({ id: "f", payload: { value: 1 } })]);
     await flushMicrotasks();
 
     // 1 invoke (first attempt — no prior failures).
@@ -460,9 +488,9 @@ describe("invokeWithRetry", () => {
       { ...BASE_CONFIG, maxAttempts: 3, invokeRetries: 3 },
     );
 
-    await queue.handle(
+    await queue.handle([
       makeMessage<Payload>({ id: "f", payload: { value: 1 } }),
-    );
+    ]);
     await new Promise((r) => setTimeout(r, 30));
 
     // 2 failures + 1 success = 3 total invoke calls.
@@ -481,9 +509,9 @@ describe("invokeWithRetry", () => {
       { ...BASE_CONFIG, maxAttempts: 3, invokeRetries: 2 },
     );
 
-    await queue.handle(
+    await queue.handle([
       makeMessage<Payload>({ id: "f", payload: { value: 1 } }),
-    );
+    ]);
     await new Promise((r) => setTimeout(r, 30));
 
     // invokeRetries=2 → 1 initial + 2 retries = 3 total attempts.
@@ -511,7 +539,7 @@ describe("handle — never throws", () => {
     );
 
     await expect(
-      queue.handle(makeMessage<Payload>({ payload: { value: 1 } })),
+      queue.handle([makeMessage<Payload>({ payload: { value: 1 } })]),
     ).resolves.toBeUndefined();
   });
 
@@ -530,7 +558,7 @@ describe("handle — never throws", () => {
     );
 
     await expect(
-      queue.handle(makeMessage<Payload>({ payload: { value: 1 } })),
+      queue.handle([makeMessage<Payload>({ payload: { value: 1 } })]),
     ).resolves.toBeUndefined();
   });
 
@@ -547,9 +575,9 @@ describe("handle — never throws", () => {
     );
 
     await expect(
-      queue.handle(
+      queue.handle([
         makeMessage<Payload>({ id: "boom", payload: { value: 1 } }),
-      ),
+      ]),
     ).resolves.toBeUndefined();
   });
 
@@ -568,7 +596,7 @@ describe("handle — never throws", () => {
     );
 
     await expect(
-      queue.handle(makeMessage<Payload>({ payload: { value: 1 } })),
+      queue.handle([makeMessage<Payload>({ payload: { value: 1 } })]),
     ).resolves.toBeUndefined();
   });
 });
@@ -586,7 +614,7 @@ describe("100 simultaneous messages — different queues (in-memory loopback)", 
       queueId: `q-${i}`, // each message on its own isolated queue
     }));
 
-    await Promise.all(messages.map((msg) => queue.handle(msg)));
+    await Promise.all(messages.map((msg) => queue.handle([msg])));
 
     expect(storage.countByState("done")).toBe(100);
     expect(storage.countByState("pending")).toBe(0);
@@ -601,7 +629,7 @@ describe("100 simultaneous messages — same queue with batch draining (in-memor
 
     const messages = makeMessages<Payload>(100, { value: 0 }, "q-serial");
 
-    await Promise.all(messages.map((msg) => queue.handle(msg)));
+    await Promise.all(messages.map((msg) => queue.handle([msg])));
 
     // Self-invocations are fire-and-forget — wait until all settle.
     await waitFor(
@@ -623,8 +651,8 @@ describe("100 simultaneous messages — with failures and retries (in-memory loo
 
     let queue!: MessageQueue<Payload>;
     class LoopbackInvoker extends MessageInvoker<Payload> {
-      async invoke(msg: QueueMessage<Payload>) {
-        await queue.handle(msg);
+      async invoke(messages: QueueMessage<Payload>[]) {
+        await queue.handle(messages);
       }
     }
 
@@ -641,7 +669,7 @@ describe("100 simultaneous messages — with failures and retries (in-memory loo
       .filter((_, i) => i % 5 === 0)
       .forEach((m) => action.failFirst(m.id));
 
-    await Promise.all(messages.map((msg) => queue.handle(msg)));
+    await Promise.all(messages.map((msg) => queue.handle([msg])));
 
     await waitFor(
       () =>
@@ -668,11 +696,11 @@ describe("Bun HTTP server — 100 concurrent requests", () => {
     let serverUrl = "";
 
     class HttpInvoker extends MessageInvoker<Payload> {
-      async invoke(message: QueueMessage<Payload>): Promise<void> {
+      async invoke(messages: QueueMessage<Payload>[]): Promise<void> {
         const res = await fetch(serverUrl, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(message),
+          body: JSON.stringify(messages),
         });
         if (!res.ok) throw new Error(`Server returned ${res.status}`);
       }
@@ -689,7 +717,7 @@ describe("Bun HTTP server — 100 concurrent requests", () => {
     const server = Bun.serve({
       port: 0, // random available port
       async fetch(req) {
-        const body = (await req.json()) as QueueMessage<Payload>;
+        const body = (await req.json()) as QueueMessage<Payload>[];
         await queue.handle(body);
         return new Response("ok", { status: 200 });
       },
@@ -710,12 +738,10 @@ describe("Bun HTTP server — 100 concurrent requests", () => {
         fetch(serverUrl, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(msg),
+          body: JSON.stringify([msg]),
         }),
       ),
     );
-
-    // Every response must be 200 — handle never throws.
     expect(responses.every((r) => r.status === 200)).toBe(true);
 
     // Wait for any in-flight self-invocations to complete.
@@ -741,7 +767,7 @@ describe("Bun HTTP server — 100 concurrent requests", () => {
     let failCount = 0;
 
     class FlakyHttpInvoker extends MessageInvoker<Payload> {
-      async invoke(message: QueueMessage<Payload>): Promise<void> {
+      async invoke(messages: QueueMessage<Payload>[]): Promise<void> {
         // First 10 self-invocations fail to exercise invokeWithRetry.
         if (failCount < 10) {
           failCount++;
@@ -750,7 +776,7 @@ describe("Bun HTTP server — 100 concurrent requests", () => {
         const res = await fetch(serverUrl, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(message),
+          body: JSON.stringify(messages),
         });
         if (!res.ok) throw new Error(`Server returned ${res.status}`);
       }
@@ -767,7 +793,7 @@ describe("Bun HTTP server — 100 concurrent requests", () => {
     const server = Bun.serve({
       port: 0,
       async fetch(req) {
-        const body = (await req.json()) as QueueMessage<Payload>;
+        const body = (await req.json()) as QueueMessage<Payload>[];
         await queue.handle(body);
         return new Response("ok", { status: 200 });
       },
@@ -785,7 +811,7 @@ describe("Bun HTTP server — 100 concurrent requests", () => {
         fetch(serverUrl, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(msg),
+          body: JSON.stringify([msg]),
         }),
       ),
     );

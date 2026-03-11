@@ -22,14 +22,14 @@ import type { QueueMessage } from "../types.ts";
  * @example
  * ```ts
  * class FetchInvoker extends MessageInvoker<MyPayload> {
- *   async invoke(message) {
+ *   async invoke(messages) {
  *     const res = await fetch(process.env.QUEUE_URL!, {
  *       method: 'POST',
  *       headers: {
  *         'Content-Type': 'application/json',
  *         'Authorization': `Bearer ${process.env.QUEUE_SECRET}`,
  *       },
- *       body: JSON.stringify(message),
+ *       body: JSON.stringify(messages),
  *     });
  *     if (!res.ok) throw new Error(`Self-invoke failed: ${res.status}`);
  *   }
@@ -38,7 +38,7 @@ import type { QueueMessage } from "../types.ts";
  */
 export abstract class MessageInvoker<T = unknown> {
   /**
-   * Fire a request to the queue's own serverless endpoint carrying `message`.
+   * Fire a request to the queue's own serverless endpoint carrying `messages`.
    *
    * Throw any error to signal that the invocation failed — the orchestrator
    * will retry up to `QueueConfig.invokeRetries` times before giving up.
@@ -46,5 +46,5 @@ export abstract class MessageInvoker<T = unknown> {
    * Implementations MUST NOT swallow errors; let them propagate so the
    * retry logic in `MessageQueue` can act on them.
    */
-  abstract invoke(message: QueueMessage<T>): Promise<void>;
+  abstract invoke(messages: QueueMessage<T>[]): Promise<void>;
 }

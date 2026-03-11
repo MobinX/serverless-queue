@@ -58,44 +58,37 @@ export class MessageQueue<T = unknown> {
   }
 
   /**
-   * Handle a single inbound invocation.
+   * Handle an array of inbound invocations.
    * Call this with the parsed JSON body of every request to your serverless function.
    *
    * The method always resolves (never throws) so the function can always
    * return HTTP 200 — preventing platform-level retries from kicking in.
    */
-  async handle(message: QueueMessage<T>): Promise<void> {
+  async handle(messages: QueueMessage<T>[]): Promise<void> {
     try {
-      if (message.type === "new") {
-        const shouldDefer = await this.isBusy(message.queueId);
+      if (!messages.length) return;
+      const firstType = messages[0]!.type;
 
-        if (shouldDefer) {
-          await this.storage.writeMessage(
-            this.toStoredMessage(message, "pending"),
-          );
-          return;
+      if (firstType === 'new') {
+        const toProcess: QueueMessage<T>[] = [];
+        for (const message of messages) {
+          const shouldDefer = await this.isBusy(message.queueId);
+          await this.storage.writeMessage(this.toStoredMessage(message, 'pending'));
+          if (!shouldDefer) {
+            await this.storage.updateMessage(this.toStoredMessage(message, 'processing'));
+            toProcess.push(message);
+          }
         }
-
-        // Queue is idle — write then immediately take ownership.
-        await this.storage.writeMessage(
-          this.toStoredMessage(message, "pending"),
-        );
-        await this.storage.updateMessage(
-          this.toStoredMessage(message, "processing"),
-        );
+        if (toProcess.length > 0) await this.process(toProcess);
       } else {
         // 'retry' or 'flush' — previous invocation already holds the processing slot.
-        await this.storage.updateMessage(
-          this.toStoredMessage(message, "processing"),
-        );
+        for (const message of messages) {
+          await this.storage.updateMessage(this.toStoredMessage(message, 'processing'));
+        }
+        await this.process(messages);
       }
-
-      await this.process(message);
-    } catch (error) {
-      // Storage failures in the setup phase — the message stays in its current
-      // state for external recovery (e.g. a TTL-based cleanup job).
-      // Swallow the error to honour the "never throws" contract so the
-      // serverless platform always receives HTTP 200 and won't retry blindly.
+    } catch {
+      // Storage failures — swallow to honour "never throws" contract
     }
   }
 
@@ -104,38 +97,43 @@ export class MessageQueue<T = unknown> {
   /**
    * Execute the action and handle success / failure paths.
    */
-  private async process(message: QueueMessage<T>): Promise<void> {
+  private async process(messages: QueueMessage<T>[]): Promise<void> {
     try {
-      await this.action.execute(message);
-      await this.onSuccess(message);
+      await this.action.execute(messages);
+      await this.onSuccess(messages);
     } catch (error) {
-      await this.onFailure(message, error);
+      await this.onFailure(messages, error);
     }
   }
 
-  private async onSuccess(message: QueueMessage<T>): Promise<void> {
-    await this.storage.updateMessage(this.toStoredMessage(message, "done"));
-    await this.drainPending(message.queueId);
+  private async onSuccess(messages: QueueMessage<T>[]): Promise<void> {
+    for (const message of messages) {
+      await this.storage.updateMessage(this.toStoredMessage(message, 'done'));
+    }
+    const queueIds = [...new Set(messages.map(m => m.queueId))];
+    for (const queueId of queueIds) {
+      await this.drainPending(queueId);
+    }
   }
 
   private async onFailure(
-    message: QueueMessage<T>,
+    messages: QueueMessage<T>[],
     error: unknown,
   ): Promise<void> {
+    const firstMsg = messages[0]!;
     const canRetry =
-      message.attempt < this.config.maxAttempts - 1 &&
-      this.retryStrategy.shouldRetry(message, error);
+      firstMsg.attempt < this.config.maxAttempts - 1 &&
+      this.retryStrategy.shouldRetry(firstMsg, error);
 
     if (canRetry) {
-      const retried: QueueMessage<T> = {
-        ...message,
-        attempt: message.attempt + 1,
-        type: "retry",
-      };
-      // Keep the row in 'processing' state — the next invocation inherits ownership.
-      await this.storage.updateMessage(
-        this.toStoredMessage(retried, "processing"),
-      );
+      const retried: QueueMessage<T>[] = messages.map(msg => ({
+        ...msg,
+        attempt: msg.attempt + 1,
+        type: 'retry' as const,
+      }));
+      for (const msg of retried) {
+        await this.storage.updateMessage(this.toStoredMessage(msg, 'processing'));
+      }
       this.selfInvoke(retried);
       return;
     }
@@ -144,30 +142,45 @@ export class MessageQueue<T = unknown> {
     // onExhausted is user-land code (DLQ, alerting, etc.) — isolate its
     // failure so the queue still advances even if that side-effect errors.
     try {
-      await this.retryStrategy.onExhausted(message);
+      for (const msg of messages) await this.retryStrategy.onExhausted(msg);
     } catch {
       // onExhausted failed — continue to mark failed and drain.
     }
-    await this.storage.updateMessage(this.toStoredMessage(message, "failed"));
-    await this.drainPending(message.queueId);
+    for (const msg of messages) {
+      await this.storage.updateMessage(this.toStoredMessage(msg, 'failed'));
+    }
+    const queueIds = [...new Set(messages.map(m => m.queueId))];
+    for (const queueId of queueIds) {
+      await this.drainPending(queueId);
+    }
   }
 
   /**
-   * If pending messages exist, fire a self-invocation for each message in the
-   * next batch (up to `batchSize`) and return immediately.
+   * If pending messages exist, fire self-invocations for the next batch
+   * (up to `batchSize`) and return immediately. Behaviour depends on
+   * `drainMode`: `'bulk'` sends all pending messages in one invoke;
+   * `'individual'` (default) sends one invoke per message.
    */
   private async drainPending(queueId: string): Promise<void> {
-    const { batchSize } = this.config;
+    const { batchSize, drainMode } = this.config;
     const pending = await this.storage.readMessagesByQueue(
       queueId,
-      "pending",
+      'pending',
       batchSize,
     );
     if (pending.length === 0) return;
 
-    for (const stored of pending) {
-      const msg = this.fromStoredMessage(stored);
-      this.selfInvoke({ ...msg, type: "flush" });
+    const msgs = pending.map(stored => ({
+      ...this.fromStoredMessage(stored),
+      type: 'flush' as const,
+    }));
+
+    if (drainMode === 'bulk') {
+      this.selfInvoke(msgs);
+    } else {
+      for (const msg of msgs) {
+        this.selfInvoke([msg]);
+      }
     }
   }
 
@@ -175,16 +188,16 @@ export class MessageQueue<T = unknown> {
    * Fire-and-forget self-invocation via the injected `MessageInvoker`.
    * On failure, immediately fires a new invoke attempt and returns — the
    * current instance is never blocked waiting for retries.
-   * Once `invokeRetries` attempts are exhausted the message remains in its
-   * current state so an external recovery job (e.g. cron) can pick it up.
+   * Once `invokeRetries` attempts are exhausted the messages remain in their
+   * current state so an external recovery job (e.g. cron) can pick them up.
    */
-  private selfInvoke(message: QueueMessage<T>, invokeAttempt = 0): void {
-    this.invoker.invoke(message).catch(() => {
+  private selfInvoke(messages: QueueMessage<T>[], invokeAttempt = 0): void {
+    this.invoker.invoke(messages).catch(() => {
       const maxRetries = this.config.invokeRetries ?? 3;
       if (invokeAttempt < maxRetries) {
-        this.selfInvoke(message, invokeAttempt + 1);
+        this.selfInvoke(messages, invokeAttempt + 1);
       }
-      // Retries exhausted — message stays in current state for recovery.
+      // Retries exhausted — messages stay in current state for recovery.
     });
   }
 

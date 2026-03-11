@@ -107,4 +107,14 @@ export interface QueueConfig {
    * exhausted, allowing external recovery (e.g. a cron-based cleanup job).
    */
   invokeRetries?: number;
+
+  /**
+   * Controls how `drainPending` fires self-invocations after a message
+   * completes (successfully or after exhausting retries).
+   *
+   * - `'individual'` (default) — fires one self-invocation per pending message.
+   * - `'bulk'` — fires one self-invocation carrying all pending messages as a
+   *   single batch.
+   */
+  drainMode?: 'bulk' | 'individual';
 }

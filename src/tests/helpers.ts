@@ -82,14 +82,16 @@ export class SpyAction<T = unknown> extends MessageAction<T> {
     return this;
   }
 
-  async execute(message: QueueMessage<T>): Promise<void> {
-    this.executed.push(message);
-    if (this.failAlwaysIds.has(message.id)) {
-      throw new Error(`Action failed for ${message.id}`);
-    }
-    if (this.failOnceIds.has(message.id)) {
-      this.failOnceIds.delete(message.id);
-      throw new Error(`First-attempt failure for ${message.id}`);
+  async execute(messages: QueueMessage<T>[]): Promise<void> {
+    this.executed.push(...messages);
+    for (const message of messages) {
+      if (this.failAlwaysIds.has(message.id)) {
+        throw new Error(`Action failed for ${message.id}`);
+      }
+      if (this.failOnceIds.has(message.id)) {
+        this.failOnceIds.delete(message.id);
+        throw new Error(`First-attempt failure for ${message.id}`);
+      }
     }
   }
 }
@@ -132,7 +134,7 @@ export class SpyRetryStrategy<T = unknown> extends RetryStrategy<T> {
 export class SpyInvoker<T = unknown> extends MessageInvoker<T> {
   readonly invoked: QueueMessage<T>[] = [];
   private remainingFailures = 0;
-  private callThrough: ((msg: QueueMessage<T>) => Promise<void>) | null = null;
+  private callThrough: ((msgs: QueueMessage<T>[]) => Promise<void>) | null = null;
 
   /** Fail the first `n` invoke calls, then succeed. */
   failTimes(n: number): this {
@@ -141,18 +143,18 @@ export class SpyInvoker<T = unknown> extends MessageInvoker<T> {
   }
 
   /** After any failures, delegate to `fn` (e.g. a self-invoking queue). */
-  onSuccess(fn: (msg: QueueMessage<T>) => Promise<void>): this {
+  onSuccess(fn: (msgs: QueueMessage<T>[]) => Promise<void>): this {
     this.callThrough = fn;
     return this;
   }
 
-  async invoke(message: QueueMessage<T>): Promise<void> {
-    this.invoked.push(message);
+  async invoke(messages: QueueMessage<T>[]): Promise<void> {
+    this.invoked.push(...messages);
     if (this.remainingFailures > 0) {
       this.remainingFailures--;
       throw new Error("Invoke failed");
     }
-    await this.callThrough?.(message);
+    await this.callThrough?.(messages);
   }
 }
 
