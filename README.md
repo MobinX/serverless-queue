@@ -6,6 +6,20 @@
 
 > **Your serverless function already has a database. Stop paying for a message broker.**
 
+**`serverless-queue` is a TypeScript library that turns any serverless function into a durable, ordered, self-retrying message queue — using only your existing database and HTTP.** No Redis. No RabbitMQ. No SQS. No extra infrastructure.
+
+You write a background job (send email, process webhook, sync data). You point the library at your database and your own API route. It handles ordering, retries, failure recovery, and backpressure — all within the constraints of serverless: stateless functions, 30-second time limits, cold starts.
+
+Works out of the box with:
+
+| Platform | Storage | Notes |
+|---|---|---|
+| **Next.js** (Vercel) | Neon, Vercel Postgres, Supabase | `app/api/queue/route.ts` is your queue endpoint |
+| **Cloudflare Workers** | D1, Turso | Use `env.SELF.fetch()` for self-invocation |
+| **AWS Lambda** | RDS, Postgres, SQLite | Any Drizzle adapter works |
+| **Node.js / Express** | Any Postgres or SQLite | Full control, same API |
+| **Vercel Edge Functions** | Neon serverless, Supabase | Use `waitUntil()` for edge runtimes |
+
 ---
 
 ## The problem every serverless developer hits
