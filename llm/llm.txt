@@ -1,0 +1,2041 @@
+SERVERLESS-QUEUE — COMPLETE LLM REFERENCE
+==========================================
+
+serverless-queue is a zero-dependency TypeScript library that turns any serverless
+function into a reliable, persistent, per-tenant message queue. Instead of relying
+on platform-specific queue primitives (SQS, Cloud Tasks, Upstash QStash), it stores
+messages in whatever database you already have (Postgres, SQLite, D1, Redis) and
+re-invokes its own HTTP endpoint to process them. Each queueId is a FIFO serial
+lane — concurrent incoming messages for the same queueId are safely deferred as
+pending while the current message is being processed. The library handles retries,
+dead-letter logic, and drain cycles through four pluggable abstract classes that
+you implement once for your stack.
+
+
+=== INSTALLATION ===
+
+npm install serverless-queue
+bun add serverless-queue
+pnpm add serverless-queue
+
+No runtime dependencies. Bring your own database client.
+TypeScript 5+ required as a peer dependency.
+
+
+=== EXPORTS ===
+
+From 'serverless-queue':
+
+  MessageQueue        class    — Core orchestrator. Instantiate once, call handle().
+  MessageStorage      class    — Abstract base: implement for your DB.
+  MessageAction       class    — Abstract base: implement your business logic.
+  RetryStrategy       class    — Abstract base: implement retry/DLQ policy.
+  MessageInvoker      class    — Abstract base: implement self-invocation transport.
+  QueueMessage        type     — Envelope that travels in every HTTP request body.
+  StoredMessage       type     — Raw row persisted to the database.
+  QueueConfig         type     — Static configuration for MessageQueue.
+  MessageType         type     — Union: "new" | "retry" | "flush"
+  MessageState        type     — Union: "pending" | "processing" | "done" | "failed"
+
+
+=== TYPES ===
+
+export type MessageType = "new" | "retry" | "flush";
+
+export type MessageState = "pending" | "processing" | "done" | "failed";
+
+export interface QueueMessage<T = unknown> {
+  id: string;           // Unique message identifier (UUID recommended).
+  queueId: string;      // Queue partition key — e.g. userId, tenantId, orderId.
+  payload: T;           // The typed business payload for this message.
+  attempt: number;      // Zero-indexed attempt counter.
+  createdAt: number;    // Unix timestamp (ms) when the message was first created.
+  type: MessageType;    // Invocation type — determines orchestrator entry-point.
+}
+
+export interface StoredMessage {
+  id: string;           // Unique message identifier — matches QueueMessage.id.
+  queueId: string;      // Queue partition key — matches QueueMessage.queueId.
+  message: string;      // JSON.stringify(QueueMessage) — opaque to the storage layer.
+  timestamp: number;    // Unix timestamp (ms) — used for ordering.
+  state: MessageState;  // Current lifecycle state.
+}
+
+export interface QueueConfig {
+  batchSize: number;          // Max pending messages fetched per drain cycle.
+  maxAttempts: number;        // Max total attempts including first (not retries).
+  invokeRetries?: number;     // Retry count for failed self-invocations. Default 3.
+  drainMode?: 'bulk' | 'individual'; // How drain fires self-invokes. Default 'individual'.
+}
+
+
+=== ABSTRACT CLASSES — CONTRACT ===
+
+--- MessageStorage ---
+
+Abstract persistence layer. Implement all seven methods for your database.
+The storage layer is NOT generic — it always works with StoredMessage.
+The QueueMessage<T> ↔ StoredMessage serialization is owned by MessageQueue.
+
+  readMessage(id: string): Promise<StoredMessage | null>
+    What it must do:   SELECT by primary key id. Return null if not found.
+    What it must NOT:  Throw when not found — return null.
+    When called:       Rarely by orchestrator; mainly useful for debugging.
+
+  writeMessage(message: StoredMessage): Promise<void>
+    What it must do:   INSERT a new row. Throw on duplicate id.
+    What it must NOT:  Silently overwrite an existing row with the same id.
+    When called:       When a new message arrives (type: 'new') to record it as pending.
+
+  updateMessage(message: StoredMessage): Promise<void>
+    What it must do:   UPDATE the existing row identified by message.id in-place.
+                       Typically advances the state field.
+    What it must NOT:  Insert a new row if id is not found (fail silently or throw).
+    When called:       Many times per message lifecycle: pending→processing, processing→done, etc.
+
+  deleteMessage(id: string): Promise<void>
+    What it must do:   DELETE the row with this id.
+    What it must NOT:  Throw if the row does not exist.
+    When called:       Optional hard-delete path. The orchestrator does not call this
+                       automatically — it is available for implementers who prefer
+                       hard deletes over keeping history.
+
+  readLastMessageByQueue(queueId: string): Promise<StoredMessage | null>
+    What it must do:   Return the single most-recent message for queueId
+                       (ORDER BY timestamp DESC LIMIT 1). Return null if none.
+    What it must NOT:  Return any row other than the latest by timestamp. Wrong
+                       ordering breaks the busy-lock check.
+    When called:       On every new message to check if the queue is busy.
+
+  readMessagesByQueue(
+    queueId: string,
+    state?: MessageState,
+    limit?: number
+  ): Promise<StoredMessage[]>
+    What it must do:   Return messages for queueId filtered by state (if provided),
+                       ordered by timestamp ASC (FIFO), capped at limit rows.
+    What it must NOT:  Return messages in random or DESC order.
+    When called:       During drain cycles to find pending messages (with limit = batchSize).
+
+  readPendingMessages(queueId: string, limit: number): Promise<StoredMessage[]>
+    What it must do:   Equivalent to readMessagesByQueue(queueId, 'pending', limit).
+                       Return pending messages ordered by timestamp ASC, capped at limit.
+    What it must NOT:  Return messages in any other state.
+    When called:       Can be called for batch pre-fetch or look-ahead operations.
+
+
+--- MessageAction<T> ---
+
+Contains the actual work to be done per invocation.
+
+  execute(messages: QueueMessage<T>[]): Promise<void>
+    What it must do:   Process all messages in the array. Throw any error to signal failure.
+    What it must NOT:  Swallow errors — throw so the orchestrator can apply retry logic.
+    When called:       Inside process(), after messages are marked processing.
+
+
+--- RetryStrategy<T> ---
+
+Controls retry policy and dead-letter handling.
+
+  shouldRetry(message: QueueMessage<T>, error: unknown): boolean
+    What it must do:   Return true to retry, false to exhaust immediately.
+                       Called only when message.attempt < config.maxAttempts - 1.
+    What it must NOT:  Be async. Must be synchronous.
+    When called:       In onFailure(), after action.execute() throws.
+                       message.attempt is NOT yet incremented at the time of the call.
+
+  onExhausted(message: QueueMessage<T>): Promise<void>
+    What it must do:   Perform dead-letter, alerting, logging, etc.
+                       After this resolves, orchestrator marks the message 'failed'.
+    What it must NOT:  Throw without internal try/catch. The orchestrator wraps the
+                       call in its own try/catch, so thrown errors are swallowed.
+                       Always log inside onExhausted or failures will be silent.
+    When called:       After shouldRetry returns false, or attempt >= maxAttempts.
+
+
+--- MessageInvoker<T> ---
+
+Self-invocation transport layer.
+
+  invoke(messages: QueueMessage<T>[]): Promise<void>
+    What it must do:   POST messages (as a JSON array) to the queue endpoint.
+                       Throw on non-2xx responses or network errors.
+    What it must NOT:  Swallow errors. The orchestrator retry logic depends on throws.
+                       Accept a single QueueMessage — always serialize as an array.
+    When called:       From selfInvoke() which is fire-and-forget via .catch().
+                       invoke() receives QueueMessage<T>[] — always an array.
+
+
+=== MessageQueue — THE ORCHESTRATOR ===
+
+Constructor:
+
+  new MessageQueue<T>(
+    storage: MessageStorage,
+    action: MessageAction<T>,
+    retryStrategy: RetryStrategy<T>,
+    invoker: MessageInvoker<T>,
+    config: QueueConfig,
+  )
+
+  The type parameter T is inferred from the MessageAction implementation.
+  Construct once (module-level singleton) and reuse across invocations.
+
+handle() signature:
+
+  async handle(messages: QueueMessage<T>[]): Promise<void>
+
+  Invariants:
+    - NEVER throws. All errors are caught internally.
+    - Callers should always await it, then return HTTP 200 regardless.
+    - If messages is empty, returns immediately (no-op).
+
+Full invocation flow:
+
+  1. If messages is empty → return.
+  2. Inspect messages[0].type → firstType.
+
+  3. If firstType === 'new':
+     - For each message in messages:
+       a. Call isBusy(message.queueId):
+          - Read the most-recent stored message for queueId.
+          - Busy = last message state is 'pending' or 'processing'.
+       b. writeMessage(toStoredMessage(message, 'pending')) — always write the row.
+       c. If NOT busy:
+          - updateMessage(toStoredMessage(message, 'processing'))
+          - Add to toProcess array.
+     - If toProcess is non-empty → call process(toProcess).
+
+  4. If firstType === 'retry' or 'flush':
+     - For each message: updateMessage(toStoredMessage(message, 'processing')).
+     - Call process(messages).
+
+  5. process(messages):
+     - Try: await action.execute(messages) → await onSuccess(messages).
+     - Catch error: await onFailure(messages, error).
+
+  6. onSuccess(messages):
+     - For each message: updateMessage(state = 'done').
+     - Collect unique queueIds from messages.
+     - For each queueId: await drainPending(queueId).
+
+  7. onFailure(messages, error):
+     - firstMsg = messages[0].
+     - canRetry = firstMsg.attempt < config.maxAttempts - 1
+                  && retryStrategy.shouldRetry(firstMsg, error).
+     - If canRetry:
+         - Build retried = messages.map(msg => ({ ...msg, attempt: msg.attempt + 1, type: 'retry' })).
+         - For each retried msg: updateMessage(state = 'processing').
+         - selfInvoke(retried)  ← fire-and-forget.
+         - Return.
+     - If NOT canRetry (exhausted):
+         - try { for each msg: await retryStrategy.onExhausted(msg) } catch { /* swallow */ }
+         - For each msg: updateMessage(state = 'failed').
+         - For each unique queueId: await drainPending(queueId).
+
+  8. drainPending(queueId):
+     - Read up to batchSize pending messages via storage.readMessagesByQueue(queueId, 'pending', batchSize).
+     - If none → return.
+     - Map each StoredMessage → QueueMessage (JSON.parse stored.message) with type: 'flush'.
+     - If drainMode === 'bulk': selfInvoke(allMsgs)  ← one invoke for all.
+     - Else (default 'individual'): for each msg: selfInvoke([msg]).
+
+  9. selfInvoke(messages, invokeAttempt = 0):
+     - invoker.invoke(messages).catch(() => {
+         const maxRetries = config.invokeRetries ?? 3;
+         if (invokeAttempt < maxRetries) selfInvoke(messages, invokeAttempt + 1);
+         // If exhausted: messages stay in current state for recovery.
+       })
+     - This is ALWAYS fire-and-forget — the promise is never awaited.
+     - The outer handle() call returns while retries may still be in flight.
+
+selfInvoke fire-and-forget explained:
+
+  selfInvoke never blocks the current invocation. It calls invoker.invoke() and
+  immediately attaches a .catch() handler. The current invocation completes and
+  returns HTTP 200 before the self-invoked HTTP call has even been made. This
+  means the serverless function exits while background microtasks may still run
+  (depending on the platform). On edge runtimes (Cloudflare Workers, Vercel Edge)
+  use ctx.waitUntil() to keep the runtime alive long enough for the invoke:
+
+    export default {
+      async fetch(request, env, ctx) {
+        const msgs = await request.json();
+        ctx.waitUntil(queue.handle(msgs));
+        return new Response(null, { status: 200 });
+      }
+    };
+
+
+=== WIRING — COMPLETE MINIMAL EXAMPLE ===
+
+This example uses only in-memory implementations. No database required.
+Run it with: bun run example.ts
+
+  import {
+    MessageQueue,
+    MessageStorage,
+    MessageAction,
+    RetryStrategy,
+    MessageInvoker,
+  } from 'serverless-queue';
+  import type {
+    QueueMessage,
+    StoredMessage,
+    MessageState,
+  } from 'serverless-queue';
+
+  // --- Payload type ---
+  type EmailPayload = { to: string; subject: string; body: string };
+
+  // --- In-memory storage ---
+  class InMemoryStorage extends MessageStorage {
+    private store = new Map<string, StoredMessage>();
+
+    async readMessage(id: string) {
+      return this.store.get(id) ?? null;
+    }
+    async writeMessage(msg: StoredMessage) {
+      if (this.store.has(msg.id)) throw new Error('Duplicate id: ' + msg.id);
+      this.store.set(msg.id, { ...msg });
+    }
+    async updateMessage(msg: StoredMessage) {
+      this.store.set(msg.id, { ...msg });
+    }
+    async deleteMessage(id: string) {
+      this.store.delete(id);
+    }
+    async readLastMessageByQueue(queueId: string) {
+      const msgs = [...this.store.values()]
+        .filter(m => m.queueId === queueId)
+        .sort((a, b) => b.timestamp - a.timestamp);
+      return msgs[0] ?? null;
+    }
+    async readMessagesByQueue(queueId: string, state?: MessageState, limit?: number) {
+      let msgs = [...this.store.values()]
+        .filter(m => m.queueId === queueId && (!state || m.state === state))
+        .sort((a, b) => a.timestamp - b.timestamp);
+      if (limit !== undefined) msgs = msgs.slice(0, limit);
+      return msgs;
+    }
+    async readPendingMessages(queueId: string, limit: number) {
+      return this.readMessagesByQueue(queueId, 'pending', limit);
+    }
+  }
+
+  // --- Action ---
+  class SendEmailAction extends MessageAction<EmailPayload> {
+    async execute(messages: QueueMessage<EmailPayload>[]) {
+      for (const msg of messages) {
+        console.log(`Sending email to ${msg.payload.to}: ${msg.payload.subject}`);
+        // await emailClient.send(msg.payload);
+      }
+    }
+  }
+
+  // --- Retry strategy ---
+  class SimpleRetryStrategy extends RetryStrategy<EmailPayload> {
+    shouldRetry(_msg: QueueMessage<EmailPayload>, error: unknown): boolean {
+      return error instanceof Error && error.message.includes('network');
+    }
+    async onExhausted(msg: QueueMessage<EmailPayload>) {
+      console.error('Message exhausted after all retries:', msg.id);
+    }
+  }
+
+  // --- Self-invoker (loopback for local use) ---
+  let queue: MessageQueue<EmailPayload>;
+
+  class LoopbackInvoker extends MessageInvoker<EmailPayload> {
+    async invoke(messages: QueueMessage<EmailPayload>[]) {
+      await queue.handle(messages);
+    }
+  }
+
+  // --- Wire it up ---
+  queue = new MessageQueue<EmailPayload>(
+    new InMemoryStorage(),
+    new SendEmailAction(),
+    new SimpleRetryStrategy(),
+    new LoopbackInvoker(),
+    { batchSize: 5, maxAttempts: 3 },
+  );
+
+  // --- Enqueue a message ---
+  const message: QueueMessage<EmailPayload> = {
+    id: crypto.randomUUID(),
+    queueId: 'user-123',        // one serial lane per user
+    payload: { to: 'alice@example.com', subject: 'Hello', body: 'Hi Alice!' },
+    attempt: 0,
+    createdAt: Date.now(),
+    type: 'new',
+  };
+
+  await queue.handle([message]);
+  console.log('Done');
+
+
+=== DATABASE REQUIREMENTS ===
+
+Required table schema (SQL):
+
+  CREATE TABLE queue_messages (
+    id         TEXT        NOT NULL PRIMARY KEY,
+    queue_id   TEXT        NOT NULL,
+    message    TEXT        NOT NULL,   -- JSON.stringify(QueueMessage)
+    timestamp  BIGINT      NOT NULL,   -- Unix ms
+    state      TEXT        NOT NULL    -- 'pending' | 'processing' | 'done' | 'failed'
+  );
+
+Required index (MANDATORY — without it reads are full table scans):
+
+  CREATE INDEX idx_queue_messages_queue_id_timestamp
+    ON queue_messages (queue_id, timestamp);
+
+Atomicity requirement:
+
+  The orchestrator performs a busy-check then write as two separate calls:
+    1. readLastMessageByQueue(queueId)   — checks if queue is busy
+    2. writeMessage(msg, 'pending')      — records the new message
+    3. updateMessage(msg, 'processing')  — promotes to processing if not busy
+
+  Under concurrent invocations for the same queueId these three steps are NOT
+  atomic by default. To prevent double-processing:
+
+  PostgreSQL / SQLite:  Wrap steps 2–3 in a BEGIN / COMMIT transaction.
+  DynamoDB:             Use a ConditionExpression on writeMessage.
+  Redis:                Use SETNX or a Lua script for the busy-check + write.
+
+  For most workloads (one message per user per few seconds) the race window is
+  small and acceptable. Add transactions when you need strict serial guarantees.
+
+
+=== STORAGE IMPLEMENTATIONS ===
+
+-- PostgreSQL (using 'pg' Pool) --
+
+  import { Pool } from 'pg';
+  import { MessageStorage } from 'serverless-queue';
+  import type { MessageState, StoredMessage } from 'serverless-queue';
+
+  export class PostgresStorage extends MessageStorage {
+    constructor(private pool: Pool) { super(); }
+
+    async readMessage(id: string): Promise<StoredMessage | null> {
+      const { rows } = await this.pool.query(
+        'SELECT id, queue_id, message, timestamp, state FROM queue_messages WHERE id = $1',
+        [id],
+      );
+      if (!rows[0]) return null;
+      return this.toStored(rows[0]);
+    }
+
+    async writeMessage(msg: StoredMessage): Promise<void> {
+      await this.pool.query(
+        `INSERT INTO queue_messages (id, queue_id, message, timestamp, state)
+         VALUES ($1, $2, $3, $4, $5)`,
+        [msg.id, msg.queueId, msg.message, msg.timestamp, msg.state],
+      );
+    }
+
+    async updateMessage(msg: StoredMessage): Promise<void> {
+      await this.pool.query(
+        `UPDATE queue_messages SET message = $2, timestamp = $3, state = $4
+         WHERE id = $1`,
+        [msg.id, msg.message, msg.timestamp, msg.state],
+      );
+    }
+
+    async deleteMessage(id: string): Promise<void> {
+      await this.pool.query('DELETE FROM queue_messages WHERE id = $1', [id]);
+    }
+
+    async readLastMessageByQueue(queueId: string): Promise<StoredMessage | null> {
+      const { rows } = await this.pool.query(
+        `SELECT id, queue_id, message, timestamp, state
+         FROM queue_messages
+         WHERE queue_id = $1
+         ORDER BY timestamp DESC
+         LIMIT 1`,
+        [queueId],
+      );
+      if (!rows[0]) return null;
+      return this.toStored(rows[0]);
+    }
+
+    async readMessagesByQueue(
+      queueId: string,
+      state?: MessageState,
+      limit?: number,
+    ): Promise<StoredMessage[]> {
+      const params: unknown[] = [queueId];
+      let sql = `SELECT id, queue_id, message, timestamp, state
+                 FROM queue_messages
+                 WHERE queue_id = $1`;
+      if (state) {
+        params.push(state);
+        sql += ` AND state = $${params.length}`;
+      }
+      sql += ' ORDER BY timestamp ASC';
+      if (limit !== undefined) {
+        params.push(limit);
+        sql += ` LIMIT $${params.length}`;
+      }
+      const { rows } = await this.pool.query(sql, params);
+      return rows.map(r => this.toStored(r));
+    }
+
+    async readPendingMessages(queueId: string, limit: number): Promise<StoredMessage[]> {
+      return this.readMessagesByQueue(queueId, 'pending', limit);
+    }
+
+    private toStored(row: Record<string, unknown>): StoredMessage {
+      return {
+        id: row.id as string,
+        queueId: row.queue_id as string,
+        message: row.message as string,
+        timestamp: Number(row.timestamp),
+        state: row.state as MessageState,
+      };
+    }
+  }
+
+  // Atomic write for concurrent safety (optional):
+  async writeMessageAtomic(msg: StoredMessage): Promise<void> {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      const { rows } = await client.query(
+        `SELECT state FROM queue_messages
+         WHERE queue_id = $1
+         ORDER BY timestamp DESC LIMIT 1
+         FOR UPDATE`,
+        [msg.queueId],
+      );
+      const busy = rows[0] && (rows[0].state === 'pending' || rows[0].state === 'processing');
+      await client.query(
+        `INSERT INTO queue_messages (id, queue_id, message, timestamp, state)
+         VALUES ($1, $2, $3, $4, $5)`,
+        [msg.id, msg.queueId, msg.message, msg.timestamp, busy ? 'pending' : msg.state],
+      );
+      await client.query('COMMIT');
+    } catch (e) {
+      await client.query('ROLLBACK');
+      throw e;
+    } finally {
+      client.release();
+    }
+  }
+
+
+-- Upstash Redis (using '@upstash/redis') --
+
+  import { Redis } from '@upstash/redis';
+  import { MessageStorage } from 'serverless-queue';
+  import type { MessageState, StoredMessage } from 'serverless-queue';
+
+  // Storage layout:
+  //   Hash  key: `qm:{id}`                  fields: id, queueId, message, timestamp, state
+  //   ZSet  key: `qm:queue:{queueId}`        score: timestamp, member: id
+  //   ZSet  key: `qm:state:{queueId}:{state}` score: timestamp, member: id
+
+  export class UpstashRedisStorage extends MessageStorage {
+    constructor(private redis: Redis) { super(); }
+
+    private hashKey(id: string) { return `qm:${id}`; }
+    private queueKey(queueId: string) { return `qm:queue:${queueId}`; }
+    private stateKey(queueId: string, state: string) {
+      return `qm:state:${queueId}:${state}`;
+    }
+
+    async readMessage(id: string): Promise<StoredMessage | null> {
+      const data = await this.redis.hgetall(this.hashKey(id));
+      if (!data) return null;
+      return this.toStored(data);
+    }
+
+    async writeMessage(msg: StoredMessage): Promise<void> {
+      const exists = await this.redis.exists(this.hashKey(msg.id));
+      if (exists) throw new Error(`Duplicate message id: ${msg.id}`);
+      const pipe = this.redis.pipeline();
+      pipe.hset(this.hashKey(msg.id), {
+        id: msg.id,
+        queueId: msg.queueId,
+        message: msg.message,
+        timestamp: msg.timestamp,
+        state: msg.state,
+      });
+      pipe.zadd(this.queueKey(msg.queueId), {
+        score: msg.timestamp,
+        member: msg.id,
+      });
+      pipe.zadd(this.stateKey(msg.queueId, msg.state), {
+        score: msg.timestamp,
+        member: msg.id,
+      });
+      await pipe.exec();
+    }
+
+    async updateMessage(msg: StoredMessage): Promise<void> {
+      const old = await this.readMessage(msg.id);
+      const pipe = this.redis.pipeline();
+      pipe.hset(this.hashKey(msg.id), {
+        message: msg.message,
+        timestamp: msg.timestamp,
+        state: msg.state,
+      });
+      // Move from old state set to new state set
+      if (old && old.state !== msg.state) {
+        pipe.zrem(this.stateKey(msg.queueId, old.state), msg.id);
+      }
+      pipe.zadd(this.stateKey(msg.queueId, msg.state), {
+        score: msg.timestamp,
+        member: msg.id,
+      });
+      pipe.zadd(this.queueKey(msg.queueId), {
+        score: msg.timestamp,
+        member: msg.id,
+      });
+      await pipe.exec();
+    }
+
+    async deleteMessage(id: string): Promise<void> {
+      const msg = await this.readMessage(id);
+      if (!msg) return;
+      const pipe = this.redis.pipeline();
+      pipe.del(this.hashKey(id));
+      pipe.zrem(this.queueKey(msg.queueId), id);
+      pipe.zrem(this.stateKey(msg.queueId, msg.state), id);
+      await pipe.exec();
+    }
+
+    async readLastMessageByQueue(queueId: string): Promise<StoredMessage | null> {
+      const ids = await this.redis.zrange(this.queueKey(queueId), -1, -1);
+      if (!ids.length) return null;
+      return this.readMessage(ids[0] as string);
+    }
+
+    async readMessagesByQueue(
+      queueId: string,
+      state?: MessageState,
+      limit?: number,
+    ): Promise<StoredMessage[]> {
+      let ids: string[];
+      if (state) {
+        const stop = limit !== undefined ? limit - 1 : -1;
+        ids = (await this.redis.zrange(
+          this.stateKey(queueId, state), 0, stop,
+        )) as string[];
+      } else {
+        const stop = limit !== undefined ? limit - 1 : -1;
+        ids = (await this.redis.zrange(this.queueKey(queueId), 0, stop)) as string[];
+      }
+      const msgs = await Promise.all(ids.map(id => this.readMessage(id)));
+      return msgs.filter(Boolean) as StoredMessage[];
+    }
+
+    async readPendingMessages(queueId: string, limit: number): Promise<StoredMessage[]> {
+      return this.readMessagesByQueue(queueId, 'pending', limit);
+    }
+
+    private toStored(data: Record<string, unknown>): StoredMessage {
+      return {
+        id: data.id as string,
+        queueId: data.queueId as string,
+        message: data.message as string,
+        timestamp: Number(data.timestamp),
+        state: data.state as MessageState,
+      };
+    }
+  }
+
+
+-- Cloudflare D1 --
+
+  import { MessageStorage } from 'serverless-queue';
+  import type { MessageState, StoredMessage } from 'serverless-queue';
+
+  interface D1Database {
+    prepare(sql: string): D1PreparedStatement;
+  }
+  interface D1PreparedStatement {
+    bind(...values: unknown[]): D1PreparedStatement;
+    first<T = unknown>(): Promise<T | null>;
+    all<T = unknown>(): Promise<{ results: T[] }>;
+    run(): Promise<void>;
+  }
+
+  export class D1Storage extends MessageStorage {
+    constructor(private db: D1Database) { super(); }
+
+    async readMessage(id: string): Promise<StoredMessage | null> {
+      const row = await this.db
+        .prepare('SELECT id, queue_id, message, timestamp, state FROM queue_messages WHERE id = ?')
+        .bind(id)
+        .first<Record<string, unknown>>();
+      if (!row) return null;
+      return this.toStored(row);
+    }
+
+    async writeMessage(msg: StoredMessage): Promise<void> {
+      await this.db
+        .prepare(
+          'INSERT INTO queue_messages (id, queue_id, message, timestamp, state) VALUES (?, ?, ?, ?, ?)',
+        )
+        .bind(msg.id, msg.queueId, msg.message, msg.timestamp, msg.state)
+        .run();
+    }
+
+    async updateMessage(msg: StoredMessage): Promise<void> {
+      await this.db
+        .prepare(
+          'UPDATE queue_messages SET message = ?, timestamp = ?, state = ? WHERE id = ?',
+        )
+        .bind(msg.message, msg.timestamp, msg.state, msg.id)
+        .run();
+    }
+
+    async deleteMessage(id: string): Promise<void> {
+      await this.db
+        .prepare('DELETE FROM queue_messages WHERE id = ?')
+        .bind(id)
+        .run();
+    }
+
+    async readLastMessageByQueue(queueId: string): Promise<StoredMessage | null> {
+      const row = await this.db
+        .prepare(
+          `SELECT id, queue_id, message, timestamp, state
+           FROM queue_messages
+           WHERE queue_id = ?
+           ORDER BY timestamp DESC
+           LIMIT 1`,
+        )
+        .bind(queueId)
+        .first<Record<string, unknown>>();
+      if (!row) return null;
+      return this.toStored(row);
+    }
+
+    async readMessagesByQueue(
+      queueId: string,
+      state?: MessageState,
+      limit?: number,
+    ): Promise<StoredMessage[]> {
+      let sql = `SELECT id, queue_id, message, timestamp, state
+                 FROM queue_messages WHERE queue_id = ?`;
+      const params: unknown[] = [queueId];
+      if (state) {
+        sql += ' AND state = ?';
+        params.push(state);
+      }
+      sql += ' ORDER BY timestamp ASC';
+      if (limit !== undefined) {
+        sql += ' LIMIT ?';
+        params.push(limit);
+      }
+      const stmt = this.db.prepare(sql);
+      const bound = params.reduce(
+        (s, p) => s.bind(p),
+        stmt,
+      );
+      const { results } = await bound.all<Record<string, unknown>>();
+      return results.map(r => this.toStored(r));
+    }
+
+    async readPendingMessages(queueId: string, limit: number): Promise<StoredMessage[]> {
+      return this.readMessagesByQueue(queueId, 'pending', limit);
+    }
+
+    private toStored(row: Record<string, unknown>): StoredMessage {
+      return {
+        id: row.id as string,
+        queueId: row.queue_id as string,
+        message: row.message as string,
+        timestamp: Number(row.timestamp),
+        state: row.state as MessageState,
+      };
+    }
+  }
+
+
+-- SQLite (using 'better-sqlite3') --
+
+  import Database from 'better-sqlite3';
+  import { MessageStorage } from 'serverless-queue';
+  import type { MessageState, StoredMessage } from 'serverless-queue';
+
+  export class SQLiteStorage extends MessageStorage {
+    private db: Database.Database;
+
+    constructor(dbPath: string) {
+      super();
+      this.db = new Database(dbPath);
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS queue_messages (
+          id        TEXT    NOT NULL PRIMARY KEY,
+          queue_id  TEXT    NOT NULL,
+          message   TEXT    NOT NULL,
+          timestamp INTEGER NOT NULL,
+          state     TEXT    NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_queue_messages_queue_id_timestamp
+          ON queue_messages (queue_id, timestamp);
+      `);
+    }
+
+    async readMessage(id: string): Promise<StoredMessage | null> {
+      const row = this.db
+        .prepare('SELECT id, queue_id, message, timestamp, state FROM queue_messages WHERE id = ?')
+        .get(id) as Record<string, unknown> | undefined;
+      if (!row) return null;
+      return this.toStored(row);
+    }
+
+    async writeMessage(msg: StoredMessage): Promise<void> {
+      this.db
+        .prepare(
+          'INSERT INTO queue_messages (id, queue_id, message, timestamp, state) VALUES (?, ?, ?, ?, ?)',
+        )
+        .run(msg.id, msg.queueId, msg.message, msg.timestamp, msg.state);
+    }
+
+    async updateMessage(msg: StoredMessage): Promise<void> {
+      this.db
+        .prepare(
+          'UPDATE queue_messages SET message = ?, timestamp = ?, state = ? WHERE id = ?',
+        )
+        .run(msg.message, msg.timestamp, msg.state, msg.id);
+    }
+
+    async deleteMessage(id: string): Promise<void> {
+      this.db.prepare('DELETE FROM queue_messages WHERE id = ?').run(id);
+    }
+
+    async readLastMessageByQueue(queueId: string): Promise<StoredMessage | null> {
+      const row = this.db
+        .prepare(
+          `SELECT id, queue_id, message, timestamp, state
+           FROM queue_messages
+           WHERE queue_id = ?
+           ORDER BY timestamp DESC LIMIT 1`,
+        )
+        .get(queueId) as Record<string, unknown> | undefined;
+      if (!row) return null;
+      return this.toStored(row);
+    }
+
+    async readMessagesByQueue(
+      queueId: string,
+      state?: MessageState,
+      limit?: number,
+    ): Promise<StoredMessage[]> {
+      let sql = `SELECT id, queue_id, message, timestamp, state
+                 FROM queue_messages WHERE queue_id = ?`;
+      const params: unknown[] = [queueId];
+      if (state) { sql += ' AND state = ?'; params.push(state); }
+      sql += ' ORDER BY timestamp ASC';
+      if (limit !== undefined) { sql += ' LIMIT ?'; params.push(limit); }
+      const rows = this.db.prepare(sql).all(...params) as Record<string, unknown>[];
+      return rows.map(r => this.toStored(r));
+    }
+
+    async readPendingMessages(queueId: string, limit: number): Promise<StoredMessage[]> {
+      return this.readMessagesByQueue(queueId, 'pending', limit);
+    }
+
+    private toStored(row: Record<string, unknown>): StoredMessage {
+      return {
+        id: row.id as string,
+        queueId: row.queue_id as string,
+        message: row.message as string,
+        timestamp: Number(row.timestamp),
+        state: row.state as MessageState,
+      };
+    }
+  }
+
+
+=== ACTION IMPLEMENTATIONS ===
+
+-- Send email with Resend --
+
+  import { Resend } from 'resend';
+  import { MessageAction } from 'serverless-queue';
+  import type { QueueMessage } from 'serverless-queue';
+
+  type EmailPayload = {
+    to: string;
+    subject: string;
+    html: string;
+    from?: string;
+  };
+
+  export class SendEmailAction extends MessageAction<EmailPayload> {
+    private resend: Resend;
+    private defaultFrom: string;
+
+    constructor(apiKey: string, defaultFrom = 'noreply@example.com') {
+      super();
+      this.resend = new Resend(apiKey);
+      this.defaultFrom = defaultFrom;
+    }
+
+    async execute(messages: QueueMessage<EmailPayload>[]): Promise<void> {
+      for (const msg of messages) {
+        const { error } = await this.resend.emails.send({
+          from: msg.payload.from ?? this.defaultFrom,
+          to: msg.payload.to,
+          subject: msg.payload.subject,
+          html: msg.payload.html,
+        });
+        if (error) throw new Error(`Resend error: ${error.message}`);
+      }
+    }
+  }
+
+
+-- Call webhook --
+
+  import { MessageAction } from 'serverless-queue';
+  import type { QueueMessage } from 'serverless-queue';
+
+  type WebhookPayload = {
+    url: string;
+    method?: string;
+    headers?: Record<string, string>;
+    body: unknown;
+  };
+
+  export class WebhookAction extends MessageAction<WebhookPayload> {
+    async execute(messages: QueueMessage<WebhookPayload>[]): Promise<void> {
+      for (const msg of messages) {
+        const { url, method = 'POST', headers = {}, body } = msg.payload;
+        const res = await fetch(url, {
+          method,
+          headers: { 'Content-Type': 'application/json', ...headers },
+          body: JSON.stringify(body),
+        });
+        if (!res.ok) {
+          throw new Error(`Webhook ${url} responded ${res.status}`);
+        }
+      }
+    }
+  }
+
+
+-- Write to database --
+
+  import { Pool } from 'pg';
+  import { MessageAction } from 'serverless-queue';
+  import type { QueueMessage } from 'serverless-queue';
+
+  type DbWritePayload = {
+    table: string;
+    data: Record<string, unknown>;
+  };
+
+  export class DbWriteAction extends MessageAction<DbWritePayload> {
+    constructor(private pool: Pool) { super(); }
+
+    async execute(messages: QueueMessage<DbWritePayload>[]): Promise<void> {
+      for (const msg of messages) {
+        const { table, data } = msg.payload;
+        const keys = Object.keys(data);
+        const values = Object.values(data);
+        const cols = keys.join(', ');
+        const placeholders = keys.map((_, i) => `$${i + 1}`).join(', ');
+        await this.pool.query(
+          `INSERT INTO ${table} (${cols}) VALUES (${placeholders})`,
+          values,
+        );
+      }
+    }
+  }
+
+
+=== RETRY STRATEGY IMPLEMENTATIONS ===
+
+-- Simple retry (always retry network errors, never retry validation errors) --
+
+  import { RetryStrategy } from 'serverless-queue';
+  import type { QueueMessage } from 'serverless-queue';
+
+  export class SimpleRetryStrategy<T> extends RetryStrategy<T> {
+    shouldRetry(_msg: QueueMessage<T>, error: unknown): boolean {
+      if (!(error instanceof Error)) return true;
+      // Do not retry validation / client errors
+      const noRetry = ['ValidationError', 'NotFoundError', 'UnauthorizedError'];
+      if (noRetry.some(name => error.constructor.name === name)) return false;
+      // Retry everything else (network timeouts, 5xx, etc.)
+      return true;
+    }
+
+    async onExhausted(msg: QueueMessage<T>): Promise<void> {
+      try {
+        console.error('[queue] Message exhausted', {
+          id: msg.id,
+          queueId: msg.queueId,
+          attempt: msg.attempt,
+        });
+      } catch {
+        // Never throw from onExhausted
+      }
+    }
+  }
+
+
+-- Exponential back-off with jitter (capped) --
+
+  NOTE: The library fires self-invokes immediately — there is no built-in
+  delay mechanism in shouldRetry(). To implement back-off, sleep at the
+  START of execute() based on the attempt number:
+
+    async execute(messages: QueueMessage<T>[]) {
+      const attempt = messages[0]?.attempt ?? 0;
+      if (attempt > 0) {
+        const delayMs = Math.min(
+          1000 * Math.pow(2, attempt) + Math.random() * 500,
+          30_000, // cap at 30s
+        );
+        await new Promise(r => setTimeout(r, delayMs));
+      }
+      // ... actual work
+    }
+
+  The RetryStrategy itself only decides whether to retry:
+
+  import { RetryStrategy } from 'serverless-queue';
+  import type { QueueMessage } from 'serverless-queue';
+
+  export class ExponentialBackoffStrategy<T> extends RetryStrategy<T> {
+    constructor(
+      private readonly dlqFn?: (msg: QueueMessage<T>) => Promise<void>,
+    ) { super(); }
+
+    shouldRetry(_msg: QueueMessage<T>, error: unknown): boolean {
+      // Retry all errors — let maxAttempts control the cap.
+      // For finer control, inspect error.constructor.name or status codes here.
+      return true;
+    }
+
+    async onExhausted(msg: QueueMessage<T>): Promise<void> {
+      try {
+        console.error('[queue] Exhausted after retries', {
+          id: msg.id,
+          attempt: msg.attempt,
+        });
+        if (this.dlqFn) await this.dlqFn(msg);
+      } catch (e) {
+        console.error('[queue] onExhausted hook failed', e);
+      }
+    }
+  }
+
+  // Usage in action:
+  class MyActionWithBackoff extends MessageAction<MyPayload> {
+    async execute(messages: QueueMessage<MyPayload>[]) {
+      const attempt = messages[0]?.attempt ?? 0;
+      if (attempt > 0) {
+        const delay = Math.min(1000 * 2 ** attempt + Math.random() * 500, 30_000);
+        await new Promise(r => setTimeout(r, delay));
+      }
+      // ... actual work
+    }
+  }
+
+
+-- DLQ + Slack alert on exhausted --
+
+  import { RetryStrategy } from 'serverless-queue';
+  import type { QueueMessage } from 'serverless-queue';
+
+  export class DLQSlackStrategy<T> extends RetryStrategy<T> {
+    constructor(
+      private readonly slackWebhookUrl: string,
+      private readonly dlqFn: (msg: QueueMessage<T>) => Promise<void>,
+    ) { super(); }
+
+    shouldRetry(_msg: QueueMessage<T>, error: unknown): boolean {
+      if (error instanceof Error) {
+        // Skip retries for client errors (4xx mapped to custom types)
+        if (error.message.startsWith('HTTP 4')) return false;
+      }
+      return true;
+    }
+
+    async onExhausted(msg: QueueMessage<T>): Promise<void> {
+      try {
+        // Push to DLQ
+        await this.dlqFn(msg);
+        // Alert Slack
+        await fetch(this.slackWebhookUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            text: `*Queue message exhausted* after ${msg.attempt + 1} attempts\n` +
+                  `ID: \`${msg.id}\`  Queue: \`${msg.queueId}\``,
+          }),
+        });
+      } catch (e) {
+        // Always catch — never re-throw from onExhausted
+        console.error('[queue] DLQ/Slack onExhausted failed', e);
+      }
+    }
+  }
+
+
+=== INVOKER IMPLEMENTATIONS ===
+
+-- Native fetch (works in all modern runtimes) --
+
+  IMPORTANT: invoke() always receives QueueMessage<T>[] (an array).
+  Always serialize as a JSON array and always deserialize as an array.
+
+  import { MessageInvoker } from 'serverless-queue';
+  import type { QueueMessage } from 'serverless-queue';
+
+  export class FetchInvoker<T> extends MessageInvoker<T> {
+    constructor(
+      private readonly queueUrl: string,
+      private readonly secret?: string,
+    ) { super(); }
+
+    async invoke(messages: QueueMessage<T>[]): Promise<void> {
+      const headers: Record<string, string> = {
+        'Content-Type': 'application/json',
+      };
+      if (this.secret) {
+        headers['Authorization'] = `Bearer ${this.secret}`;
+      }
+      const res = await fetch(this.queueUrl, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(messages),  // ← always array
+      });
+      if (!res.ok) {
+        throw new Error(`Self-invoke failed: ${res.status} ${res.statusText}`);
+      }
+    }
+  }
+
+
+-- Cloudflare Workers SELF binding --
+
+  import { MessageInvoker } from 'serverless-queue';
+  import type { QueueMessage } from 'serverless-queue';
+
+  interface SelfBinding {
+    fetch(request: Request): Promise<Response>;
+  }
+
+  export class CloudflareWorkerSelfInvoker<T> extends MessageInvoker<T> {
+    constructor(
+      private readonly self: SelfBinding,
+      private readonly path: string = '/queue',
+      private readonly secret?: string,
+    ) { super(); }
+
+    async invoke(messages: QueueMessage<T>[]): Promise<void> {
+      const headers: Record<string, string> = {
+        'Content-Type': 'application/json',
+      };
+      if (this.secret) headers['Authorization'] = `Bearer ${this.secret}`;
+      const request = new Request(`http://self${this.path}`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(messages),  // ← always array
+      });
+      const res = await this.self.fetch(request);
+      if (!res.ok) {
+        throw new Error(`Self-invoke failed: ${res.status}`);
+      }
+    }
+  }
+
+
+-- Axios (Node.js) --
+
+  import axios from 'axios';
+  import { MessageInvoker } from 'serverless-queue';
+  import type { QueueMessage } from 'serverless-queue';
+
+  export class AxiosInvoker<T> extends MessageInvoker<T> {
+    constructor(
+      private readonly queueUrl: string,
+      private readonly secret?: string,
+    ) { super(); }
+
+    async invoke(messages: QueueMessage<T>[]): Promise<void> {
+      const headers: Record<string, string> = {};
+      if (this.secret) headers['Authorization'] = `Bearer ${this.secret}`;
+      await axios.post(this.queueUrl, messages, {  // ← always array
+        headers,
+        validateStatus: status => status < 400,
+      });
+    }
+  }
+
+
+=== ENQUEUEING A MESSAGE ===
+
+A new message is a plain QueueMessage<T> object with type: 'new'.
+You create it and either:
+  a) Call queue.handle([msg]) directly (in-process, for testing or loopback setups)
+  b) POST it as a JSON array to the queue endpoint (production, serverless)
+
+Full QueueMessage structure you must build:
+
+  const message: QueueMessage<YourPayload> = {
+    id: crypto.randomUUID(),      // unique per message — use crypto.randomUUID() or nanoid
+    queueId: 'user-123',          // partition key — all msgs with same key are serial
+    payload: {                    // your typed business data
+      to: 'alice@example.com',
+      subject: 'Welcome',
+    },
+    attempt: 0,                   // always 0 for new messages
+    createdAt: Date.now(),        // unix ms — determines FIFO order within a queue
+    type: 'new',                  // always 'new' for messages you enqueue
+  };
+
+  // Option A: direct call (in-process)
+  await queue.handle([message]);
+
+  // Option B: HTTP POST to the queue endpoint
+  await fetch('https://yourapp.com/api/queue', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': 'Bearer ' + process.env.QUEUE_SECRET,
+    },
+    body: JSON.stringify([message]),  // ← always wrap in array
+  });
+
+  // Multiple messages for DIFFERENT queues — each gets its own lane
+  await queue.handle([
+    { id: crypto.randomUUID(), queueId: 'user-alice', payload: { ... }, attempt: 0, createdAt: Date.now(), type: 'new' },
+    { id: crypto.randomUUID(), queueId: 'user-bob',   payload: { ... }, attempt: 0, createdAt: Date.now(), type: 'new' },
+  ]);
+
+  IMPORTANT: Never reuse an id. Each message must have a globally unique id.
+  IMPORTANT: Messages with the same queueId will be serialized — the second will
+  be deferred as 'pending' while the first is processing.
+
+
+=== PLATFORM: NEXT.JS APP ROUTER ===
+
+-- SQL migration --
+
+  -- migrations/001_create_queue_messages.sql
+  CREATE TABLE IF NOT EXISTS queue_messages (
+    id         TEXT        NOT NULL PRIMARY KEY,
+    queue_id   TEXT        NOT NULL,
+    message    TEXT        NOT NULL,
+    timestamp  BIGINT      NOT NULL,
+    state      TEXT        NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_queue_messages_queue_id_timestamp
+    ON queue_messages (queue_id, timestamp);
+
+
+-- Environment variables --
+
+  QUEUE_URL=https://yourapp.com/api/queue
+  QUEUE_SECRET=your-secret-token
+  DATABASE_URL=postgres://user:password@host:5432/dbname
+
+
+-- lib/queue/index.ts (singleton) --
+
+  import { MessageQueue } from 'serverless-queue';
+  import { FetchInvoker } from '@/lib/queue/FetchInvoker';
+  import { PostgresStorage } from '@/lib/queue/PostgresStorage';
+  import { SendEmailAction } from '@/lib/queue/SendEmailAction';
+  import { SimpleRetryStrategy } from '@/lib/queue/SimpleRetryStrategy';
+  import { pool } from '@/lib/db';
+
+  type MyPayload = { to: string; subject: string; html: string };
+
+  // Instantiate once — Next.js module cache keeps this alive across requests.
+  export const queue = new MessageQueue<MyPayload>(
+    new PostgresStorage(pool),
+    new SendEmailAction(process.env.RESEND_API_KEY!),
+    new SimpleRetryStrategy(),
+    new FetchInvoker(
+      process.env.QUEUE_URL!,
+      process.env.QUEUE_SECRET,
+    ),
+    {
+      batchSize: 5,
+      maxAttempts: 3,
+      invokeRetries: 3,
+    },
+  );
+
+
+-- app/api/queue/route.ts --
+
+  import { NextRequest, NextResponse } from 'next/server';
+  import { queue } from '@/lib/queue';
+  import type { QueueMessage } from 'serverless-queue';
+
+  // Optional: validate a shared secret to block unauthorized self-invocations
+  function authorized(req: NextRequest): boolean {
+    const secret = process.env.QUEUE_SECRET;
+    if (!secret) return true;
+    return req.headers.get('authorization') === `Bearer ${secret}`;
+  }
+
+  export async function POST(req: NextRequest) {
+    if (!authorized(req)) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    }
+
+    // ALWAYS return 200 — never let the platform retry automatically
+    try {
+      const messages = (await req.json()) as QueueMessage<unknown>[];
+      await queue.handle(messages);
+    } catch {
+      // Even parse errors should return 200 to prevent platform retries
+    }
+
+    return NextResponse.json({ ok: true }, { status: 200 });
+  }
+
+
+-- Enqueueing from a Server Action --
+
+  'use server';
+  import { queue } from '@/lib/queue';
+  import type { QueueMessage } from 'serverless-queue';
+
+  type EmailPayload = { to: string; subject: string; html: string };
+
+  export async function sendWelcomeEmail(userId: string, email: string) {
+    const msg: QueueMessage<EmailPayload> = {
+      id: crypto.randomUUID(),
+      queueId: `user-${userId}`,
+      payload: { to: email, subject: 'Welcome!', html: '<h1>Welcome!</h1>' },
+      attempt: 0,
+      createdAt: Date.now(),
+      type: 'new',
+    };
+    await queue.handle([msg]);
+  }
+
+
+-- Enqueueing from an API Route --
+
+  import { queue } from '@/lib/queue';
+
+  export async function POST(req: NextRequest) {
+    const body = await req.json();
+    const msg: QueueMessage<EmailPayload> = {
+      id: crypto.randomUUID(),
+      queueId: `user-${body.userId}`,
+      payload: body.emailData,
+      attempt: 0,
+      createdAt: Date.now(),
+      type: 'new',
+    };
+    await queue.handle([msg]);
+    return NextResponse.json({ queued: true });
+  }
+
+
+=== PLATFORM: CLOUDFLARE WORKERS ===
+
+-- wrangler.toml excerpt --
+
+  name = "my-worker"
+  main = "src/worker.ts"
+  compatibility_date = "2024-01-01"
+
+  [[d1_databases]]
+  binding = "DB"
+  database_name = "my-queue-db"
+  database_id = "xxxx-xxxx-xxxx"
+
+  [vars]
+  QUEUE_SECRET = "your-secret"
+
+  # For self-invocation, add a service binding named SELF:
+  [[services]]
+  binding = "SELF"
+  service = "my-worker"
+
+
+-- src/worker.ts --
+
+  import { MessageQueue } from 'serverless-queue';
+  import { D1Storage } from './D1Storage';
+  import { CloudflareWorkerSelfInvoker } from './CloudflareWorkerSelfInvoker';
+  import { SendEmailAction } from './SendEmailAction';
+  import { SimpleRetryStrategy } from './SimpleRetryStrategy';
+  import type { QueueMessage } from 'serverless-queue';
+
+  type Env = {
+    DB: D1Database;
+    SELF: { fetch(req: Request): Promise<Response> };
+    QUEUE_SECRET: string;
+  };
+
+  type Payload = { to: string; subject: string; html: string };
+
+  function makeQueue(env: Env): MessageQueue<Payload> {
+    return new MessageQueue<Payload>(
+      new D1Storage(env.DB),
+      new SendEmailAction(),
+      new SimpleRetryStrategy(),
+      new CloudflareWorkerSelfInvoker(env.SELF, '/queue', env.QUEUE_SECRET),
+      { batchSize: 5, maxAttempts: 3 },
+    );
+  }
+
+  export default {
+    async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+      const url = new URL(request.url);
+
+      if (request.method === 'POST' && url.pathname === '/queue') {
+        // Validate secret
+        if (request.headers.get('authorization') !== `Bearer ${env.QUEUE_SECRET}`) {
+          return new Response('Unauthorized', { status: 401 });
+        }
+        const messages = await request.json() as QueueMessage<Payload>[];
+        const queue = makeQueue(env);
+        // ctx.waitUntil keeps the worker alive for fire-and-forget self-invokes
+        ctx.waitUntil(queue.handle(messages));
+        return new Response(JSON.stringify({ ok: true }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+
+      return new Response('Not Found', { status: 404 });
+    },
+  };
+
+
+-- How to enqueue (Cloudflare Workers) --
+
+  // From within the same worker (e.g. another route):
+  const msg: QueueMessage<Payload> = {
+    id: crypto.randomUUID(),
+    queueId: `user-${userId}`,
+    payload: { to: email, subject: 'Hello', html: '<p>Hi</p>' },
+    attempt: 0,
+    createdAt: Date.now(),
+    type: 'new',
+  };
+  ctx.waitUntil(queue.handle([msg]));
+
+
+=== PLATFORM: NODE.JS / EXPRESS ===
+
+-- Complete Express route --
+
+  import express from 'express';
+  import { MessageQueue } from 'serverless-queue';
+  import { SQLiteStorage } from './SQLiteStorage';
+  import { FetchInvoker } from './FetchInvoker';
+  import { SendEmailAction } from './SendEmailAction';
+  import { SimpleRetryStrategy } from './SimpleRetryStrategy';
+  import type { QueueMessage } from 'serverless-queue';
+
+  type Payload = { to: string; subject: string; html: string };
+
+  const queue = new MessageQueue<Payload>(
+    new SQLiteStorage('./queue.db'),  // great for development
+    new SendEmailAction(),
+    new SimpleRetryStrategy(),
+    new FetchInvoker(
+      process.env.QUEUE_URL ?? 'http://localhost:3000/queue',
+      process.env.QUEUE_SECRET,
+    ),
+    { batchSize: 5, maxAttempts: 3 },
+  );
+
+  const app = express();
+  app.use(express.json());
+
+  app.post('/queue', async (req, res) => {
+    const secret = process.env.QUEUE_SECRET;
+    if (secret && req.headers.authorization !== `Bearer ${secret}`) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+    // ALWAYS return 200
+    res.status(200).json({ ok: true });
+    // Handle after responding so the HTTP client is not kept waiting
+    const messages = req.body as QueueMessage<Payload>[];
+    await queue.handle(messages);
+  });
+
+  // Enqueue from elsewhere in the app
+  app.post('/send-email', async (req, res) => {
+    const msg: QueueMessage<Payload> = {
+      id: crypto.randomUUID(),
+      queueId: `user-${req.body.userId}`,
+      payload: req.body.email,
+      attempt: 0,
+      createdAt: Date.now(),
+      type: 'new',
+    };
+    await queue.handle([msg]);
+    res.json({ queued: true });
+  });
+
+  app.listen(3000);
+
+
+=== PLATFORM: BUN HTTP SERVER ===
+
+  import { MessageQueue } from 'serverless-queue';
+  import { SQLiteStorage } from './SQLiteStorage';
+  import { FetchInvoker } from './FetchInvoker';
+  import { SendEmailAction } from './SendEmailAction';
+  import { SimpleRetryStrategy } from './SimpleRetryStrategy';
+  import type { QueueMessage } from 'serverless-queue';
+
+  type Payload = { to: string; subject: string; html: string };
+
+  const queue = new MessageQueue<Payload>(
+    new SQLiteStorage('./queue.db'),
+    new SendEmailAction(),
+    new SimpleRetryStrategy(),
+    new FetchInvoker(
+      process.env.QUEUE_URL ?? 'http://localhost:3000/queue',
+      process.env.QUEUE_SECRET,
+    ),
+    { batchSize: 5, maxAttempts: 3 },
+  );
+
+  Bun.serve({
+    port: 3000,
+    async fetch(req) {
+      const url = new URL(req.url);
+
+      if (req.method === 'POST' && url.pathname === '/queue') {
+        const secret = process.env.QUEUE_SECRET;
+        if (secret && req.headers.get('authorization') !== `Bearer ${secret}`) {
+          return new Response('Unauthorized', { status: 401 });
+        }
+        const messages = (await req.json()) as QueueMessage<Payload>[];
+        // ALWAYS return 200 immediately
+        const response = new Response(JSON.stringify({ ok: true }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+        // Handle asynchronously after responding
+        queue.handle(messages); // intentionally not awaited here
+        return response;
+      }
+
+      return new Response('Not Found', { status: 404 });
+    },
+  });
+
+  // How to enqueue:
+  const msg: QueueMessage<Payload> = {
+    id: crypto.randomUUID(),
+    queueId: 'user-123',
+    payload: { to: 'alice@example.com', subject: 'Hi', html: '<p>Hello</p>' },
+    attempt: 0,
+    createdAt: Date.now(),
+    type: 'new',
+  };
+  await queue.handle([msg]);
+
+
+=== DRAIN MODES ===
+
+drainMode controls how the orchestrator fires self-invocations after a message
+completes (successfully or after exhausting all retries).
+
+  'individual' (default):
+    Fires one separate self-invocation per pending message.
+    Each pending message becomes its own HTTP request to the queue endpoint.
+    Use when: messages should be processed concurrently in parallel.
+    Risk: N pending messages = N simultaneous invocations. Can hit concurrency
+    limits on platforms with per-account limits.
+
+    config: { drainMode: 'individual', batchSize: 5 }
+    Result: up to 5 pending messages → 5 separate HTTP self-invokes.
+
+  'bulk':
+    Fires ONE self-invocation carrying all pending messages as a single array.
+    All messages in the batch are processed together by one action.execute() call.
+    Use when: your action supports batch operations (e.g. bulk DB inserts,
+    batch email sends) and you want to minimize invocation count.
+    Risk: if the bulk action fails, ALL messages in the batch fail together.
+
+    config: { drainMode: 'bulk', batchSize: 10 }
+    Result: up to 10 pending messages → 1 HTTP self-invoke carrying all 10.
+
+  Example:
+    const queue = new MessageQueue(storage, action, strategy, invoker, {
+      batchSize: 5,
+      maxAttempts: 3,
+      drainMode: 'bulk',        // send all pending in one request
+    });
+
+
+=== CONFIGURATION REFERENCE ===
+
+batchSize: number
+  Maximum number of pending messages to fetch and dispatch per drain cycle.
+  The orchestrator calls readMessagesByQueue(queueId, 'pending', batchSize).
+  - batchSize: 1   — process one message at a time (safest, lowest concurrency)
+  - batchSize: 5   — good default for most applications
+  - batchSize: 10  — good for high-throughput queues with cheap operations
+  - batchSize: Infinity — drain ALL pending in one cycle (use with caution,
+                   may hit platform payload limits or spawn too many invocations)
+  Tuning: lower batchSize = more sequential, fewer concurrent invocations.
+  Higher batchSize = more parallel, faster drain but more load.
+
+maxAttempts: number
+  Total number of times the action will be attempted, including the first attempt.
+  attempt 0 = first try.  attempt maxAttempts-1 = last try.
+  A message with attempt = maxAttempts-1 that fails will be exhausted.
+  Examples:
+    maxAttempts: 1 — no retries (first failure = exhausted immediately)
+    maxAttempts: 3 — one initial + two retries
+    maxAttempts: 5 — one initial + four retries
+
+invokeRetries?: number  (default: 3)
+  How many times the orchestrator retries a FAILED self-invocation
+  (i.e. when invoker.invoke() throws a network error or receives non-2xx).
+  This is NOT the same as message retries (controlled by maxAttempts).
+  If all invoke retries are exhausted, the message remains in its current
+  state ('processing' for retries, 'pending' for drain flush) and a
+  recovery cron must pick it up.
+  Example: invokeRetries: 0 — no invoke retries (fast-fail for testing)
+
+drainMode?: 'bulk' | 'individual'  (default: 'individual')
+  Controls how drainPending fires self-invocations. See DRAIN MODES section.
+
+
+=== MESSAGE STATES ===
+
+pending:
+  Set by: writeMessage() when a new message arrives and the queue is busy.
+  Meaning: Message is queued, waiting for the current message to finish.
+  Also set during drain: messages stay 'pending' in storage; drainPending
+  reads them and fires flush self-invocations to process them.
+
+processing:
+  Set by: updateMessage() immediately before action.execute() is called.
+  Meaning: Message is actively being processed by an invocation.
+  Acts as a distributed lock — isBusy() returns true when the last message
+  is 'pending' or 'processing', so no new messages for the same queueId
+  will be immediately processed.
+  Also set during retries: the retried message keeps 'processing' state
+  between the failure and the retry self-invocation.
+
+done:
+  Set by: updateMessage() in onSuccess() after action.execute() succeeds.
+  Meaning: Message processed successfully. Terminal state.
+  After this, drainPending() is called to unblock any waiting pending messages.
+
+failed:
+  Set by: updateMessage() in onFailure() after retries are exhausted.
+  Meaning: Message failed permanently. Terminal state.
+  Set after onExhausted() completes (or throws and is swallowed).
+  After this, drainPending() is called so the queue continues.
+
+
+=== CRITICAL INVARIANTS (DO NOT VIOLATE) ===
+
+1. handle() NEVER throws — always wrap in try/catch at the outermost level.
+   The method is guaranteed to resolve. If it throws, you have found a bug.
+
+2. HTTP handler ALWAYS returns 200 — platforms (Vercel, Lambda, CF Workers)
+   will retry non-2xx responses, causing duplicate message processing.
+   Return 200 even if parsing fails, even if the body is garbage.
+
+3. invoke() receives QueueMessage<T>[] (array) — always serialize as JSON array,
+   always deserialize as array. Body = JSON.stringify(messages) where messages
+   is always an array. On the receiving end: JSON.parse(body) is always an array.
+
+4. DB index on (queueId, timestamp) is REQUIRED — readLastMessageByQueue and
+   readMessagesByQueue without this index will full-scan the table.
+   Performance degrades linearly with queue depth. Add the index before going live.
+
+5. writeMessage() must throw on duplicate id — not silently overwrite.
+   Duplicate writes can corrupt message state. Use INSERT not UPSERT.
+
+6. readLastMessageByQueue() must return the LATEST by timestamp — wrong ordering
+   (e.g. ASC instead of DESC) breaks the busy-lock check. The queue will think
+   old done/failed messages are current and allow double-processing.
+
+7. The pending→processing check is NOT atomic by default — use DB transactions
+   or conditional writes for concurrent safety under high load.
+
+8. onExhausted() failure is swallowed — always log inside it or failures
+   will be invisible. The orchestrator catches and swallows any throw from
+   onExhausted. Wrap your DLQ/alerting code in try/catch + console.error.
+
+9. drainPending fires AFTER marking done/failed — pending messages are never
+   lost, but drain may not fire if the process is killed mid-flight between
+   marking done and calling selfInvoke. The recovery cron handles this case.
+
+10. selfInvoke retries are fire-and-forget — messages may stay stuck if invoke
+    keeps failing. If invokeRetries is exhausted, the message stays in its
+    current state indefinitely. Implement a recovery cron (see RECOVERY CRON).
+
+
+=== RECOVERY CRON ===
+
+Messages can get stuck in 'processing' state if:
+  - The serverless function was killed mid-flight
+  - All selfInvoke retries were exhausted
+  - The database was temporarily unavailable
+
+Find stuck messages (processing state older than N minutes):
+
+  -- Find all messages stuck in 'processing' for more than 10 minutes
+  SELECT id, queue_id, message, timestamp, state
+  FROM queue_messages
+  WHERE state = 'processing'
+    AND timestamp < (EXTRACT(EPOCH FROM NOW()) * 1000) - (10 * 60 * 1000);
+
+  -- For SQLite:
+  SELECT id, queue_id, message, timestamp, state
+  FROM queue_messages
+  WHERE state = 'processing'
+    AND timestamp < (strftime('%s', 'now') * 1000) - 600000;
+
+  -- For Cloudflare D1 (same as SQLite):
+  SELECT * FROM queue_messages
+  WHERE state = 'processing'
+    AND timestamp < (unixepoch() * 1000) - 600000;
+
+Recovery approach 1 — Reset to pending and let next invocation pick up:
+
+  UPDATE queue_messages
+  SET state = 'pending'
+  WHERE state = 'processing'
+    AND timestamp < (EXTRACT(EPOCH FROM NOW()) * 1000) - 600000;
+
+  Then trigger a self-invocation or wait for the next natural enqueue.
+
+Recovery approach 2 — Reset and immediately re-invoke (TypeScript):
+
+  import { pool } from './db';
+  import { queue } from './lib/queue';
+  import type { QueueMessage, StoredMessage } from 'serverless-queue';
+
+  export async function recoverStuckMessages(olderThanMs = 10 * 60 * 1000) {
+    const cutoff = Date.now() - olderThanMs;
+    const { rows } = await pool.query<StoredMessage>(
+      `UPDATE queue_messages
+       SET state = 'pending'
+       WHERE state = 'processing' AND timestamp < $1
+       RETURNING id, queue_id AS "queueId", message, timestamp, state`,
+      [cutoff],
+    );
+    if (!rows.length) return;
+
+    // Group by queueId and re-enqueue as flush messages
+    const byQueue = new Map<string, QueueMessage<unknown>[]>();
+    for (const row of rows) {
+      const msg: QueueMessage<unknown> = JSON.parse(row.message);
+      const list = byQueue.get(row.queueId) ?? [];
+      list.push({ ...msg, type: 'flush' });
+      byQueue.set(row.queueId, list);
+    }
+
+    for (const msgs of byQueue.values()) {
+      await queue.handle(msgs);
+    }
+  }
+
+  // Register as a cron (e.g. Vercel Cron, CF Cron Triggers, node-cron):
+  // Every 5 minutes: recoverStuckMessages(10 * 60 * 1000)
+
+
+=== COMMON MISTAKES ===
+
+1. Returning non-200 from the HTTP handler
+   Problem: Vercel, Lambda, and other platforms auto-retry on 4xx/5xx.
+   Each retry is a duplicate invocation that re-processes the same messages.
+   Fix: Always return 200. Validate auth before parsing body; return 401 for
+   unauthorized, but for any processing error return 200.
+
+2. Not awaiting handle()
+   Problem: State transitions are async. If you don't await handle(), the
+   function returns before messages are written to storage, breaking the queue.
+   Fix: Always await queue.handle(messages). The function always resolves.
+
+3. Forgetting to parse body as QueueMessage<T>[] (array)
+   Problem: handle() expects an array. Passing a single object or undefined
+   will cause silent failures or TypeScript errors.
+   Fix: const messages = await req.json() as QueueMessage<T>[];
+   Fix: const messages = JSON.parse(body) as QueueMessage<T>[];
+
+4. Using a non-unique queueId for independent messages
+   Problem: All messages with the same queueId are serialized. If you use
+   a constant like 'global' as the queueId for all users, every user's
+   messages will wait for every other user's messages to finish.
+   Fix: Use a per-entity queueId: `user-${userId}`, `order-${orderId}`, etc.
+
+5. Missing DB index
+   Problem: readLastMessageByQueue and readMessagesByQueue scan every row
+   without an index on (queue_id, timestamp). For large tables this is slow.
+   Fix: CREATE INDEX idx_queue_messages_queue_id_timestamp
+         ON queue_messages (queue_id, timestamp);
+
+6. Making invoke() async and awaiting it inside handle()
+   Problem: selfInvoke is designed to be fire-and-forget via .catch().
+   Awaiting invoker.invoke() inside handle() blocks the current invocation.
+   Fix: Never await selfInvoke(). The library never awaits it internally.
+   Your invoker.invoke() should be async but the library calls it fire-and-forget.
+
+7. Not implementing atomic writes
+   Problem: Under concurrent new messages for the same queueId, two invocations
+   may both see the queue as idle and both start processing, causing duplicates.
+   Fix: Use DB transactions (Postgres/SQLite) or conditional writes (DynamoDB/Redis)
+   to make the read-check + write atomic.
+
+8. Throwing inside onExhausted without a try/catch
+   Problem: The orchestrator wraps onExhausted in try/catch and swallows errors.
+   If onExhausted throws, the DLQ push / Slack alert / logging all silently fail.
+   Fix: Wrap ALL side effects inside onExhausted in a try/catch and log the error.
+
+
+=== TYPE SIGNATURES QUICK REFERENCE ===
+
+  // Types
+  type MessageType  = "new" | "retry" | "flush"
+  type MessageState = "pending" | "processing" | "done" | "failed"
+
+  interface QueueMessage<T = unknown> {
+    id: string; queueId: string; payload: T;
+    attempt: number; createdAt: number; type: MessageType;
+  }
+
+  interface StoredMessage {
+    id: string; queueId: string; message: string;
+    timestamp: number; state: MessageState;
+  }
+
+  interface QueueConfig {
+    batchSize: number;
+    maxAttempts: number;
+    invokeRetries?: number;
+    drainMode?: 'bulk' | 'individual';
+  }
+
+  // MessageStorage (abstract)
+  abstract class MessageStorage {
+    abstract readMessage(id: string): Promise<StoredMessage | null>
+    abstract writeMessage(message: StoredMessage): Promise<void>
+    abstract updateMessage(message: StoredMessage): Promise<void>
+    abstract deleteMessage(id: string): Promise<void>
+    abstract readLastMessageByQueue(queueId: string): Promise<StoredMessage | null>
+    abstract readMessagesByQueue(queueId: string, state?: MessageState, limit?: number): Promise<StoredMessage[]>
+    abstract readPendingMessages(queueId: string, limit: number): Promise<StoredMessage[]>
+  }
+
+  // MessageAction<T> (abstract)
+  abstract class MessageAction<T = unknown> {
+    abstract execute(messages: QueueMessage<T>[]): Promise<void>
+  }
+
+  // RetryStrategy<T> (abstract)
+  abstract class RetryStrategy<T = unknown> {
+    abstract shouldRetry(message: QueueMessage<T>, error: unknown): boolean
+    abstract onExhausted(message: QueueMessage<T>): Promise<void>
+  }
+
+  // MessageInvoker<T> (abstract)
+  abstract class MessageInvoker<T = unknown> {
+    abstract invoke(messages: QueueMessage<T>[]): Promise<void>
+  }
+
+  // MessageQueue<T>
+  class MessageQueue<T = unknown> {
+    constructor(
+      storage: MessageStorage,
+      action: MessageAction<T>,
+      retryStrategy: RetryStrategy<T>,
+      invoker: MessageInvoker<T>,
+      config: QueueConfig,
+    )
+    async handle(messages: QueueMessage<T>[]): Promise<void>
+  }
+
+
+=== TESTING ===
+
+The library is designed for easy testing. Use InMemoryStorage + LoopbackInvoker
+to write fully synchronous tests that run without a database or HTTP server.
+
+In-memory setup pattern:
+
+  import { MessageQueue, MessageStorage, MessageAction, RetryStrategy, MessageInvoker } from 'serverless-queue';
+  import type { QueueMessage, StoredMessage, MessageState } from 'serverless-queue';
+
+  class InMemoryStorage extends MessageStorage {
+    readonly store = new Map<string, StoredMessage>();
+    async readMessage(id: string) { return this.store.get(id) ?? null; }
+    async writeMessage(msg: StoredMessage) {
+      if (this.store.has(msg.id)) throw new Error('Duplicate: ' + msg.id);
+      this.store.set(msg.id, { ...msg });
+    }
+    async updateMessage(msg: StoredMessage) { this.store.set(msg.id, { ...msg }); }
+    async deleteMessage(id: string) { this.store.delete(id); }
+    async readLastMessageByQueue(queueId: string) {
+      const msgs = [...this.store.values()]
+        .filter(m => m.queueId === queueId)
+        .sort((a, b) => b.timestamp - a.timestamp);
+      return msgs[0] ?? null;
+    }
+    async readMessagesByQueue(queueId: string, state?: MessageState, limit?: number) {
+      let msgs = [...this.store.values()]
+        .filter(m => m.queueId === queueId && (!state || m.state === state))
+        .sort((a, b) => a.timestamp - b.timestamp);
+      if (limit !== undefined) msgs = msgs.slice(0, limit);
+      return msgs;
+    }
+    async readPendingMessages(queueId: string, limit: number) {
+      return this.readMessagesByQueue(queueId, 'pending', limit);
+    }
+    countByState(state: MessageState): number {
+      return [...this.store.values()].filter(m => m.state === state).length;
+    }
+  }
+
+LoopbackInvoker pattern for end-to-end tests:
+
+  // Loopback invoker routes self-invocations back through the queue in-process.
+  // This means tests run WITHOUT any HTTP server.
+  let queue: MessageQueue<Payload>;
+
+  class LoopbackInvoker extends MessageInvoker<Payload> {
+    async invoke(messages: QueueMessage<Payload>[]) {
+      await queue.handle(messages);  // loops back into the same queue
+    }
+  }
+
+  queue = new MessageQueue(
+    new InMemoryStorage(),
+    new MyAction(),
+    new MyRetryStrategy(),
+    new LoopbackInvoker(),
+    { batchSize: 5, maxAttempts: 3, invokeRetries: 0 },
+  );
+
+  // Test:
+  await queue.handle([msg]);
+  // By the time handle() resolves, all loopback invocations have also resolved
+  // (because LoopbackInvoker.invoke() is awaited in the resolved Promise chain)
+
+Fire-and-forget timing issue:
+
+  selfInvoke() calls invoker.invoke().catch() — it does NOT await the promise.
+  This means after queue.handle() returns, there may be pending microtasks
+  representing in-flight self-invocations.
+
+  Two patterns to deal with this in tests:
+
+  Pattern 1 — LoopbackInvoker with invokeRetries: 0:
+    Because LoopbackInvoker.invoke() awaits queue.handle() internally, and the
+    promise from invoke() is attached to .catch(), the microtask queue will
+    drain fully by the time your test's next await resolves.
+    Works for: simple success paths.
+
+  Pattern 2 — waitFor (polling):
+    Use a polling utility when you need to wait for async side-effects:
+
+    async function waitFor(condition: () => boolean, timeoutMs = 8000) {
+      const deadline = Date.now() + timeoutMs;
+      while (!condition()) {
+        if (Date.now() > deadline) throw new Error('waitFor timed out');
+        await new Promise(r => setTimeout(r, 10));
+      }
+    }
+
+    await queue.handle([msg1, msg2, msg3]);
+    await waitFor(() => storage.countByState('done') === 3);
+
+  Pattern 3 — flushMicrotasks:
+    async function flushMicrotasks() {
+      await new Promise(r => setTimeout(r, 0));
+    }
+    // Use after handle() to let fire-and-forget invocations start:
+    await queue.handle([msg]);
+    await flushMicrotasks();
+
+Full example test (using Bun test runner):
+
+  import { describe, it, expect } from 'bun:test';
+
+  describe('queue processes messages', () => {
+    it('executes action and marks done', async () => {
+      const executed: QueueMessage<Payload>[] = [];
+
+      class TestAction extends MessageAction<Payload> {
+        async execute(msgs: QueueMessage<Payload>[]) { executed.push(...msgs); }
+      }
+      class TestStrategy extends RetryStrategy<Payload> {
+        shouldRetry() { return false; }
+        async onExhausted() {}
+      }
+
+      const storage = new InMemoryStorage();
+      let queue: MessageQueue<Payload>;
+      class TestInvoker extends MessageInvoker<Payload> {
+        async invoke(msgs: QueueMessage<Payload>[]) { await queue.handle(msgs); }
+      }
+
+      queue = new MessageQueue(
+        storage, new TestAction(), new TestStrategy(), new TestInvoker(),
+        { batchSize: 5, maxAttempts: 3, invokeRetries: 0 },
+      );
+
+      const msg: QueueMessage<Payload> = {
+        id: 'test-1', queueId: 'q-1', payload: { value: 42 },
+        attempt: 0, createdAt: Date.now(), type: 'new',
+      };
+
+      await queue.handle([msg]);
+
+      expect(executed).toHaveLength(1);
+      expect(executed[0]!.payload).toEqual({ value: 42 });
+      expect(storage.countByState('done')).toBe(1);
+    });
+
+    it('retries on failure up to maxAttempts', async () => {
+      let callCount = 0;
+      class FailingAction extends MessageAction<Payload> {
+        async execute() { callCount++; throw new Error('fail'); }
+      }
+      class AlwaysRetry extends RetryStrategy<Payload> {
+        shouldRetry() { return true; }
+        async onExhausted() {}
+      }
+
+      const storage = new InMemoryStorage();
+      let queue: MessageQueue<Payload>;
+      class TestInvoker extends MessageInvoker<Payload> {
+        async invoke(msgs: QueueMessage<Payload>[]) { await queue.handle(msgs); }
+      }
+
+      queue = new MessageQueue(
+        storage, new FailingAction(), new AlwaysRetry(), new TestInvoker(),
+        { batchSize: 5, maxAttempts: 3, invokeRetries: 0 },
+      );
+
+      const msg: QueueMessage<Payload> = {
+        id: 'test-2', queueId: 'q-1', payload: { value: 1 },
+        attempt: 0, createdAt: Date.now(), type: 'new',
+      };
+
+      await queue.handle([msg]);
+      await waitFor(() => storage.countByState('failed') === 1);
+
+      expect(callCount).toBe(3);  // attempt 0, 1, 2 = maxAttempts: 3
+      expect(storage.countByState('failed')).toBe(1);
+    });
+  });

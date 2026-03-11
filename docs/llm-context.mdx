@@ -1,0 +1,361 @@
+---
+title: Using with AI Agents
+description: How to give AI coding agents everything they need to implement serverless-queue integrations correctly, in one file.
+---
+
+# Using with AI Agents
+
+`serverless-queue` ships a single dense context file — `llm/llm.txt` — that gives any AI coding agent everything it needs to implement a correct, production-ready integration from scratch. No back-and-forth, no missing context, no hallucinated APIs.
+
+---
+
+## What is llm.txt?
+
+`llm/llm.txt` is a self-contained plain-text reference file. It contains every type definition, every abstract class contract, complete platform examples (Next.js, Cloudflare Workers, Node.js, Bun), full storage implementations (Postgres, Redis, D1, SQLite), and a list of critical invariants and common mistakes — all in a single file you can paste directly into any AI context window.
+
+Instead of asking an agent to read multiple documentation pages, you give it one file. The agent has full context on:
+
+- The exact TypeScript types and interfaces
+- What every abstract method must and must not do
+- The precise `handle()` invocation flow, step by step
+- Complete, working implementations for every major database and platform
+- What can go wrong and how to avoid it
+
+This follows the spirit of the [llms.txt](https://llmstxt.org) convention — a standard for providing LLM-readable project documentation as a plain-text file at a predictable path.
+
+<Callout type="tip">
+**Paste once, implement correctly.** Most AI agents can fully implement a working `serverless-queue` integration from `llm.txt` alone — storage class, action class, retry strategy, invoker, and platform wiring — in a single prompt.
+</Callout>
+
+---
+
+## GitHub Copilot
+
+### Method 1 — Workspace Instructions
+
+Add a reference to `llm.txt` in `.github/copilot-instructions.md`. Copilot reads this file automatically for every chat and inline suggestion in the workspace.
+
+Create `.github/copilot-instructions.md`:
+
+```markdown
+# Copilot Workspace Instructions
+
+This project uses the `serverless-queue` library for background job processing.
+
+The complete reference for implementing serverless-queue integrations (types,
+abstract classes, platform examples, storage implementations) is in:
+
+  llm/llm.txt
+
+Read that file before implementing any queue-related code. Pay special attention
+to the CRITICAL INVARIANTS section — violating those causes hard-to-debug bugs.
+```
+
+With this in place, every Copilot Chat session in VS Code automatically has context about `serverless-queue` without you needing to reference the file manually.
+
+### Method 2 — Chat Context with `#file`
+
+In VS Code Copilot Chat, use `#file:llm/llm.txt` to attach the reference file directly to any prompt:
+
+```
+Implement a PostgreSQL MessageStorage for serverless-queue using the patterns in #file:llm/llm.txt
+```
+
+```
+Wire up a complete Next.js App Router queue endpoint. Use #file:llm/llm.txt for the implementation patterns.
+```
+
+```
+Write a RetryStrategy that pushes exhausted messages to a DLQ table. See #file:llm/llm.txt for the RetryStrategy contract.
+```
+
+### Method 3 — Inline as Context
+
+Open `llm/llm.txt` in VS Code, select all, and use **"Add selection to chat"** from the editor context menu. This injects the full file into the current Copilot Chat session as a context block.
+
+### Example Prompts
+
+```
+Using #file:llm/llm.txt as reference, implement a complete MessageStorage class for Upstash Redis.
+```
+
+```
+Using #file:llm/llm.txt, create a Next.js App Router route handler at app/api/queue/route.ts that handles serverless-queue invocations. Include the singleton at lib/queue/index.ts.
+```
+
+```
+Implement a RetryStrategy that retries network errors up to 3 times with exponential back-off, and sends a Slack alert when a message is exhausted. Use the patterns from #file:llm/llm.txt.
+```
+
+```
+Write a recovery cron that finds messages stuck in 'processing' state for more than 10 minutes and requeues them. Reference #file:llm/llm.txt for the SQL queries and recovery approach.
+```
+
+```
+Write Bun tests for the queue using an in-memory storage and loopback invoker. See the TESTING section in #file:llm/llm.txt for the exact pattern.
+```
+
+---
+
+## Claude Code
+
+### Using CLAUDE.md
+
+Claude Code reads `CLAUDE.md` at the start of every session. Add a reference to `llm.txt` so Claude always has the full context available:
+
+Create `CLAUDE.md` in your project root:
+
+```markdown
+# Claude Project Instructions
+
+## Queue: serverless-queue
+
+This project uses `serverless-queue` for reliable background processing.
+
+The complete implementation reference is at `llm/llm.txt`. This file contains:
+- All TypeScript types and interfaces (exact, copy-pasteable)
+- Abstract class contracts with full method semantics
+- Complete storage implementations (Postgres, Redis, D1, SQLite)
+- Platform wiring examples (Next.js, Cloudflare Workers, Node.js, Bun)
+- Critical invariants — read these before implementing anything
+
+When implementing queue-related code, read llm/llm.txt first and follow its
+patterns exactly, especially:
+1. handle() must always be awaited and the HTTP response must always be 200
+2. invoke() always receives and sends a QueueMessage[] array (never a single object)
+3. writeMessage() must throw on duplicate IDs (use INSERT not UPSERT)
+```
+
+### Paste at Session Start
+
+For a one-off session, paste the file content directly:
+
+```bash
+cat llm/llm.txt | claude "Using this as context, implement a Cloudflare D1 MessageStorage"
+```
+
+### Using `--context`
+
+```bash
+claude --context llm/llm.txt "implement the queue storage and wiring for Cloudflare Workers"
+```
+
+### Example Session Commands
+
+```bash
+claude "Using llm/llm.txt as context, implement a complete Cloudflare D1 MessageStorage class"
+```
+
+```bash
+claude "Read llm/llm.txt then wire up a complete Next.js App Router integration with Postgres storage"
+```
+
+```bash
+claude "Using the patterns in llm/llm.txt, write a DLQSlackStrategy that sends a Slack alert when messages are exhausted"
+```
+
+<Callout type="info">
+Claude performs especially well with `llm.txt` because the file uses `===` section headers that Claude natively recognizes as document structure. Asking Claude to "check the CRITICAL INVARIANTS section in llm.txt" reliably returns the exact invariants.
+</Callout>
+
+---
+
+## Cursor
+
+### `.cursorrules`
+
+Create `.cursorrules` in your project root to give Cursor's AI access to the reference file for all inline suggestions and Composer sessions:
+
+```
+# serverless-queue integration rules
+
+When writing any serverless-queue code (storage, action, retry strategy, invoker,
+wiring), always reference the full implementation guide at llm/llm.txt.
+
+Key rules to follow from that file:
+- MessageStorage has 7 abstract methods: readMessage, writeMessage, updateMessage,
+  deleteMessage, readLastMessageByQueue, readMessagesByQueue, readPendingMessages
+- handle() is always awaited and the HTTP handler always returns 200
+- invoke() always receives QueueMessage<T>[] (array) — serialize as JSON array
+- writeMessage() must throw on duplicate id — never silently overwrite
+- DB index on (queue_id, timestamp) is required
+
+For complete type definitions, platform examples, and storage implementations,
+read @file llm/llm.txt before generating code.
+```
+
+### Cursor Chat with `@file`
+
+In Cursor Chat or Composer, reference the file directly:
+
+```
+@file llm/llm.txt implement a PostgreSQL MessageStorage class
+```
+
+```
+@file llm/llm.txt wire up a complete Next.js App Router queue endpoint with Postgres
+```
+
+### Cursor Composer
+
+In Cursor Composer (Cmd+I / Ctrl+I), attach `llm/llm.txt` using the **"+"** button to add files to context, or type `@llm/llm.txt` in the composer prompt. Composer will read the full file and generate all the necessary implementation files in one pass.
+
+```
+@llm/llm.txt
+
+Implement the full serverless-queue integration for this Next.js project:
+1. lib/queue/PostgresStorage.ts
+2. lib/queue/SendEmailAction.ts
+3. lib/queue/SimpleRetryStrategy.ts
+4. lib/queue/FetchInvoker.ts
+5. lib/queue/index.ts (singleton)
+6. app/api/queue/route.ts (handler)
+```
+
+---
+
+## Windsurf
+
+### Global AI Rules
+
+In Windsurf, go to **Settings → AI → Rules** and add:
+
+```
+When working with serverless-queue, always read llm/llm.txt for complete type
+definitions, abstract class contracts, and implementation patterns before writing
+any code. The file is plain text with === section headers.
+```
+
+### Workspace Rules
+
+Create `.windsurfrules` in your project root:
+
+```
+# serverless-queue
+
+Full implementation reference: llm/llm.txt
+
+This file contains exact TypeScript interfaces, all abstract method contracts,
+complete storage implementations (Postgres, Redis, D1, SQLite), platform wiring
+(Next.js, CF Workers, Node.js, Bun), and critical invariants.
+
+Always reference this file when generating queue-related code.
+```
+
+### Cascade Context
+
+In Windsurf Cascade, attach `llm/llm.txt` using the **"@"** mention or file picker:
+
+```
+@llm/llm.txt implement a serverless-queue integration for Cloudflare Workers with D1 storage
+```
+
+---
+
+## Cline / Continue / Other Agents
+
+### Cline
+
+Create `.clinerules` in your project root:
+
+```
+For serverless-queue implementations, always read llm/llm.txt first.
+It contains complete type definitions, abstract class contracts, and
+working code examples for all major platforms and databases.
+```
+
+Or use the MCP file-reading capability to inject the file at task start:
+
+```
+Read the file at llm/llm.txt, then implement a PostgreSQL MessageStorage class.
+```
+
+### Continue
+
+In Continue, add `llm/llm.txt` as a context provider in `.continue/config.json`:
+
+```json
+{
+  "contextProviders": [
+    {
+      "name": "file",
+      "params": { "nRetrievedFiles": 1 }
+    }
+  ]
+}
+```
+
+Then reference it in chat:
+
+```
+@llm/llm.txt implement a complete serverless-queue integration
+```
+
+### General Pattern
+
+For any agent that accepts file or URL context:
+
+1. **File path**: Pass `llm/llm.txt` as a context file if the tool supports it.
+2. **Raw URL**: Fetch from the URL below and paste as system context.
+3. **Paste directly**: Copy the full file content and paste it before your prompt.
+
+The file is plain text with no markdown, so it pastes cleanly into any context window without formatting artifacts.
+
+---
+
+## Example Prompts That Work Well
+
+The following prompts consistently produce correct, complete implementations when paired with `llm.txt` as context.
+
+| Task | Prompt |
+|------|--------|
+| Postgres storage | `Implement a complete PostgreSQL MessageStorage for serverless-queue using the pg Pool pattern from llm.txt` |
+| Redis storage | `Implement a complete Upstash Redis MessageStorage using the hash + sorted set layout described in llm.txt` |
+| D1 storage | `Implement a Cloudflare D1 MessageStorage class following the contract in llm.txt` |
+| SQLite storage | `Implement a better-sqlite3 SQLiteStorage class for serverless-queue. Use the synchronous API wrapped in async per llm.txt` |
+| Email action | `Implement a MessageAction that sends emails using the Resend SDK, following the execute() contract from llm.txt` |
+| Retry strategy | `Write a RetryStrategy that retries network errors up to 3 times, never retries validation errors, and logs exhausted messages. Follow the shouldRetry/onExhausted contract from llm.txt` |
+| Next.js wiring | `Wire up a complete Next.js App Router serverless-queue integration: route handler at app/api/queue/route.ts and singleton at lib/queue/index.ts. Use the patterns from llm.txt.` |
+| Cloudflare Workers | `Implement a complete Cloudflare Workers queue handler using D1 storage and the SELF service binding invoker. Follow the platform example in llm.txt.` |
+| Recovery cron | `Write a recovery cron function that finds messages stuck in processing state for more than 10 minutes and requeues them. Use the SQL queries from llm.txt.` |
+| Tests | `Write tests for my queue using an in-memory storage implementation and a loopback invoker. Follow the TESTING section pattern in llm.txt, including the waitFor utility for fire-and-forget timing.` |
+
+---
+
+## Keeping llm.txt in Sync
+
+`llm/llm.txt` lives in the repository and is updated with each release. It reflects the exact types, method signatures, and behavior of the version you have installed.
+
+After upgrading `serverless-queue`, pull the latest `llm.txt` from the repository:
+
+```bash
+# If you cloned the repo
+git pull && cat llm/llm.txt
+
+# Fetch the latest version directly
+curl -o llm/llm.txt https://raw.githubusercontent.com/your-org/serverless-queue/main/llm/llm.txt
+```
+
+<Callout type="warning">
+Always use the `llm.txt` that matches your installed version. An outdated `llm.txt` may reference method signatures that have changed.
+</Callout>
+
+---
+
+## The Raw URL
+
+Use this URL in any tool that accepts URL-based context (e.g. OpenAI Custom GPTs, Dify, Flowise, or any tool with a "fetch context from URL" field):
+
+```
+https://raw.githubusercontent.com/your-org/serverless-queue/main/llm/llm.txt
+```
+
+<Callout type="info">
+Replace `your-org` with the actual GitHub organization or username once the repository is public. The raw URL always serves the plain-text file with no HTML wrapping, making it suitable for direct injection into any LLM context.
+</Callout>
+
+For a specific version tag (recommended for production use):
+
+```
+https://raw.githubusercontent.com/your-org/serverless-queue/v1.0.0/llm/llm.txt
+```
