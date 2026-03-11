@@ -52,7 +52,7 @@
     "tsup": "latest"
   },
   "peerDependencies": {
-    "drizzle-orm": ">=0.30.0",
+    "drizzle-orm": "",
     "typescript": "^5"
   },
   "peerDependenciesMeta": {
