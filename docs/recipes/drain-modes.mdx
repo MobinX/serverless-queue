@@ -1,0 +1,173 @@
+---
+title: Drain Modes
+description: When to use 'individual' vs 'bulk' drainMode — trade-offs, comparison table, and code examples.
+---
+
+# Drain Modes
+
+After a message finishes processing (success or terminal failure), the orchestrator checks for pending messages in the same queue and fires self-invocations to drain them. The `drainMode` config controls how those self-invocations are structured.
+
+---
+
+## How draining works
+
+```
+Message completes (done or failed)
+          │
+          ▼
+   drainPending(queueId)
+          │
+     pending messages?
+          │
+    ┌─────┴─────┐
+   YES          NO
+    │            │
+    ▼            └── return (nothing to do)
+  drainMode?
+    │
+   ┌┴────────────────────────────────────────┐
+   │                                         │
+'individual'                               'bulk'
+   │                                         │
+   ├── selfInvoke([msg1])                    └── selfInvoke([msg1, msg2, msg3])
+   ├── selfInvoke([msg2])
+   └── selfInvoke([msg3])
+   (all fire-and-forget, in parallel)        (one fire-and-forget call)
+```
+
+---
+
+## Comparison
+
+| | `'individual'` (default) | `'bulk'` |
+|---|---|---|
+| **HTTP calls per drain cycle** | One per pending message (up to `batchSize`) | One call for all pending messages |
+| **`execute()` array size** | Always `[msg]` — single message | Up to `batchSize` messages |
+| **Parallelism** | High — all invocations start simultaneously | None — sequential within the invocation |
+| **Partial failure** | Other messages unaffected | All messages in the batch fail together |
+| **Request payload size** | Small (1 message) | Larger (N messages) |
+| **Latency to start processing** | Immediate | Immediate (one call) |
+| **Throughput** | Higher (parallel) | Lower (sequential within batch) |
+| **Best for** | Independent messages, high throughput | Batch DB writes, bulk API calls |
+
+---
+
+## `drainMode: 'individual'` (default)
+
+Each pending message gets its own self-invocation. They all start in parallel (fire-and-forget). Your action receives an array of exactly one message.
+
+```ts
+import { MessageQueue } from 'serverless-queue';
+import type { QueueConfig } from 'serverless-queue';
+
+const config: QueueConfig = {
+  batchSize: 5,       // fire up to 5 parallel self-invocations per drain cycle
+  maxAttempts: 3,
+  drainMode: 'individual', // default — can be omitted
+};
+```
+
+```ts
+// Your action always receives [msg] — one message per invocation
+export class SendEmailAction extends MessageAction<EmailPayload> {
+  async execute(messages: QueueMessage<EmailPayload>[]): Promise<void> {
+    // messages.length === 1 in individual mode
+    const msg = messages[0]!;
+    await resend.emails.send({ to: msg.payload.to, ... });
+  }
+}
+```
+
+**Failure isolation:** If message `msg2` throws and `msg3` succeeds, they are completely independent. `msg2`'s failure doesn't affect `msg3`.
+
+---
+
+## `drainMode: 'bulk'`
+
+All pending messages (up to `batchSize`) are bundled into a single self-invocation. Your action receives all of them in one `execute` call.
+
+```ts
+const config: QueueConfig = {
+  batchSize: 10,
+  maxAttempts: 3,
+  drainMode: 'bulk',
+};
+```
+
+```ts
+// Your action receives all messages at once
+export class BulkInsertAction extends MessageAction<EventPayload> {
+  async execute(messages: QueueMessage<EventPayload>[]): Promise<void> {
+    // messages.length can be up to batchSize
+    const rows = messages.map(msg => ({
+      id: msg.id,
+      userId: msg.payload.userId,
+      event: msg.payload.event,
+      createdAt: new Date(msg.createdAt),
+    }));
+
+    // One DB round-trip for the whole batch
+    await db.events.createMany({ data: rows, skipDuplicates: true });
+  }
+}
+```
+
+**Failure behaviour:** If `execute` throws in bulk mode, **all messages in the batch** are retried together (or exhausted together). If one message has bad data, it can block the others.
+
+> ⚠️ **Warning:** In bulk mode, a single bad message can poison the whole batch. If your payloads can be individually invalid, consider `'individual'` mode or implement per-message error handling inside `execute` (catching individual errors and re-throwing only if critical).
+
+---
+
+## Choosing the right mode
+
+### Use `'individual'` when:
+
+- Messages are independent (email sends, webhook deliveries, notifications)
+- You want failure isolation (one bad message shouldn't affect others)
+- Your downstream service doesn't have a batch API
+- You're processing user-facing events where latency matters
+
+### Use `'bulk'` when:
+
+- Your action supports bulk operations (batch inserts, batch API calls)
+- You want to reduce HTTP overhead (e.g. many small messages)
+- Messages in a batch share a common resource (same DB transaction, same API key pool)
+- Processing order within the batch doesn't matter
+
+---
+
+## Mixing modes via multiple queues
+
+You can run multiple `MessageQueue` instances with different drain modes for different use cases:
+
+```ts
+// High-priority individual processing (email sends)
+export const emailQueue = new MessageQueue<EmailPayload>(
+  storage,
+  new SendEmailAction(),
+  strategy,
+  invoker,
+  { batchSize: 3, maxAttempts: 3, drainMode: 'individual' },
+);
+
+// Bulk analytics event ingestion
+export const analyticsQueue = new MessageQueue<AnalyticsEvent>(
+  storage,
+  new BulkAnalyticsAction(),
+  strategy,
+  invoker,
+  { batchSize: 50, maxAttempts: 2, drainMode: 'bulk' },
+);
+```
+
+Each queue has its own route (or shares one route with a discriminating field in the payload):
+
+```ts
+// app/api/queue/[type]/route.ts
+export async function POST(req: Request, { params }: { params: { type: string } }) {
+  const messages = await req.json();
+  if (params.type === 'email') await emailQueue.handle(messages);
+  else if (params.type === 'analytics') await analyticsQueue.handle(messages);
+  return new Response('ok');
+}
+```

@@ -1,0 +1,502 @@
+---
+title: Storage
+description: Implement MessageStorage for your database — Postgres, Redis, Cloudflare D1, SQLite, and DynamoDB patterns.
+---
+
+# Storage
+
+`MessageStorage` is the persistence layer. You implement it once for your database of choice and inject it into `MessageQueue`. The library never talks to a database directly — all queries go through your implementation.
+
+---
+
+## Interface
+
+```ts
+import { MessageStorage } from 'serverless-queue';
+import type { StoredMessage, MessageState } from 'serverless-queue';
+
+export abstract class MessageStorage {
+  abstract readMessage(id: string): Promise<StoredMessage | null>;
+  abstract writeMessage(message: StoredMessage): Promise<void>;
+  abstract updateMessage(message: StoredMessage): Promise<void>;
+  abstract deleteMessage(id: string): Promise<void>;
+  abstract readLastMessageByQueue(queueId: string): Promise<StoredMessage | null>;
+  abstract readMessagesByQueue(
+    queueId: string,
+    state?: MessageState,
+    limit?: number,
+  ): Promise<StoredMessage[]>;
+  abstract readPendingMessages(queueId: string, limit: number): Promise<StoredMessage[]>;
+}
+```
+
+### `StoredMessage` shape
+
+```ts
+interface StoredMessage {
+  id: string;        // UUID, matches QueueMessage.id
+  queueId: string;   // partition key
+  message: string;   // JSON-stringified QueueMessage envelope (opaque to storage)
+  timestamp: number; // unix ms, used for ordering
+  state: MessageState; // 'pending' | 'processing' | 'done' | 'failed'
+}
+```
+
+> 📝 **Note:** The `message` field is an opaque JSON string. The storage layer never needs to parse it — `MessageQueue` owns serialisation. Your DB stores it as `TEXT` or `VARCHAR`.
+
+---
+
+## Required DB index
+
+**All implementations must have a composite index on `(queueId, timestamp)`.**
+
+Without it, `readLastMessageByQueue` and `readMessagesByQueue` will full-scan the entire table as the queue grows.
+
+```sql
+-- PostgreSQL / SQLite
+CREATE INDEX idx_queue_messages_queue_id_timestamp
+  ON queue_messages (queue_id, timestamp DESC);
+```
+
+---
+
+## Atomicity requirements
+
+The `pending → processing` state transition in the orchestrator is two sequential operations:
+
+1. `readLastMessageByQueue(queueId)` — check if busy
+2. `updateMessage(msg, 'processing')` — claim the slot
+
+Under concurrent load, two invocations can both read "idle" before either writes "processing". To guard against this, `updateMessage` should use a **conditional write** that only succeeds if the current state is still `'pending'`.
+
+```sql
+-- PostgreSQL conditional update
+UPDATE queue_messages
+SET state = 'processing', message = $2
+WHERE id = $1 AND state = 'pending'
+RETURNING id;
+```
+
+If no rows are returned, another invocation beat you to it — the current invocation should abort gracefully (the message will be handled by the winner).
+
+---
+
+## Postgres (`@vercel/postgres`)
+
+### Schema
+
+```sql
+CREATE TABLE queue_messages (
+  id        TEXT   PRIMARY KEY,
+  queue_id  TEXT   NOT NULL,
+  message   TEXT   NOT NULL,
+  timestamp BIGINT NOT NULL,
+  state     TEXT   NOT NULL DEFAULT 'pending'
+);
+
+CREATE INDEX idx_queue_messages_queue_id_timestamp
+  ON queue_messages (queue_id, timestamp DESC);
+```
+
+### Minimal implementation
+
+```ts
+import { sql } from '@vercel/postgres';
+import { MessageStorage } from 'serverless-queue';
+import type { StoredMessage, MessageState } from 'serverless-queue';
+
+export class PostgresStorage extends MessageStorage {
+  async readMessage(id: string): Promise<StoredMessage | null> {
+    const { rows } = await sql`
+      SELECT id, queue_id AS "queueId", message, timestamp, state
+      FROM queue_messages WHERE id = ${id} LIMIT 1
+    `;
+    return (rows[0] as StoredMessage) ?? null;
+  }
+
+  async writeMessage(msg: StoredMessage): Promise<void> {
+    await sql`
+      INSERT INTO queue_messages (id, queue_id, message, timestamp, state)
+      VALUES (${msg.id}, ${msg.queueId}, ${msg.message}, ${msg.timestamp}, ${msg.state})
+    `;
+  }
+
+  async updateMessage(msg: StoredMessage): Promise<void> {
+    await sql`
+      UPDATE queue_messages
+      SET message = ${msg.message}, state = ${msg.state}
+      WHERE id = ${msg.id}
+    `;
+  }
+
+  async deleteMessage(id: string): Promise<void> {
+    await sql`DELETE FROM queue_messages WHERE id = ${id}`;
+  }
+
+  async readLastMessageByQueue(queueId: string): Promise<StoredMessage | null> {
+    const { rows } = await sql`
+      SELECT id, queue_id AS "queueId", message, timestamp, state
+      FROM queue_messages
+      WHERE queue_id = ${queueId}
+      ORDER BY timestamp DESC LIMIT 1
+    `;
+    return (rows[0] as StoredMessage) ?? null;
+  }
+
+  async readMessagesByQueue(
+    queueId: string,
+    state?: MessageState,
+    limit = 100,
+  ): Promise<StoredMessage[]> {
+    const { rows } = state
+      ? await sql`
+          SELECT id, queue_id AS "queueId", message, timestamp, state
+          FROM queue_messages
+          WHERE queue_id = ${queueId} AND state = ${state}
+          ORDER BY timestamp ASC LIMIT ${limit}
+        `
+      : await sql`
+          SELECT id, queue_id AS "queueId", message, timestamp, state
+          FROM queue_messages
+          WHERE queue_id = ${queueId}
+          ORDER BY timestamp ASC LIMIT ${limit}
+        `;
+    return rows as StoredMessage[];
+  }
+
+  async readPendingMessages(queueId: string, limit: number): Promise<StoredMessage[]> {
+    return this.readMessagesByQueue(queueId, 'pending', limit);
+  }
+}
+```
+
+### Production implementation with conditional writes
+
+```ts
+import { db } from '@vercel/postgres'; // pool-based client
+import { MessageStorage } from 'serverless-queue';
+import type { StoredMessage, MessageState } from 'serverless-queue';
+
+export class PostgresStorage extends MessageStorage {
+  async readMessage(id: string): Promise<StoredMessage | null> {
+    const client = await db.connect();
+    try {
+      const { rows } = await client.sql`
+        SELECT id, queue_id AS "queueId", message, timestamp, state
+        FROM queue_messages WHERE id = ${id} LIMIT 1
+      `;
+      return (rows[0] as StoredMessage) ?? null;
+    } finally {
+      client.release();
+    }
+  }
+
+  async writeMessage(msg: StoredMessage): Promise<void> {
+    const client = await db.connect();
+    try {
+      await client.sql`
+        INSERT INTO queue_messages (id, queue_id, message, timestamp, state)
+        VALUES (${msg.id}, ${msg.queueId}, ${msg.message}, ${msg.timestamp}, ${msg.state})
+        ON CONFLICT (id) DO NOTHING
+      `;
+    } finally {
+      client.release();
+    }
+  }
+
+  async updateMessage(msg: StoredMessage): Promise<void> {
+    const client = await db.connect();
+    try {
+      // Conditional write: only update if transitioning from 'pending' → 'processing'
+      // is the intent, but allow other transitions freely.
+      if (msg.state === 'processing') {
+        const { rowCount } = await client.sql`
+          UPDATE queue_messages
+          SET message = ${msg.message}, state = ${msg.state}
+          WHERE id = ${msg.id} AND state = 'pending'
+        `;
+        if (rowCount === 0) {
+          // Another invocation won the race — this invocation should not proceed.
+          throw new Error(`Conditional update failed for message ${msg.id}: no longer pending`);
+        }
+      } else {
+        await client.sql`
+          UPDATE queue_messages
+          SET message = ${msg.message}, state = ${msg.state}
+          WHERE id = ${msg.id}
+        `;
+      }
+    } finally {
+      client.release();
+    }
+  }
+
+  async deleteMessage(id: string): Promise<void> {
+    const client = await db.connect();
+    try {
+      await client.sql`DELETE FROM queue_messages WHERE id = ${id}`;
+    } finally {
+      client.release();
+    }
+  }
+
+  async readLastMessageByQueue(queueId: string): Promise<StoredMessage | null> {
+    const client = await db.connect();
+    try {
+      const { rows } = await client.sql`
+        SELECT id, queue_id AS "queueId", message, timestamp, state
+        FROM queue_messages
+        WHERE queue_id = ${queueId}
+        ORDER BY timestamp DESC LIMIT 1
+      `;
+      return (rows[0] as StoredMessage) ?? null;
+    } finally {
+      client.release();
+    }
+  }
+
+  async readMessagesByQueue(
+    queueId: string,
+    state?: MessageState,
+    limit = 100,
+  ): Promise<StoredMessage[]> {
+    const client = await db.connect();
+    try {
+      const { rows } = state
+        ? await client.sql`
+            SELECT id, queue_id AS "queueId", message, timestamp, state
+            FROM queue_messages
+            WHERE queue_id = ${queueId} AND state = ${state}
+            ORDER BY timestamp ASC LIMIT ${limit}
+          `
+        : await client.sql`
+            SELECT id, queue_id AS "queueId", message, timestamp, state
+            FROM queue_messages
+            WHERE queue_id = ${queueId}
+            ORDER BY timestamp ASC LIMIT ${limit}
+          `;
+      return rows as StoredMessage[];
+    } finally {
+      client.release();
+    }
+  }
+
+  async readPendingMessages(queueId: string, limit: number): Promise<StoredMessage[]> {
+    return this.readMessagesByQueue(queueId, 'pending', limit);
+  }
+}
+```
+
+---
+
+## Upstash Redis (`@upstash/redis`)
+
+Redis uses sorted sets (keyed by `queueId`) for ordering by timestamp, and a hash for individual message lookup.
+
+```ts
+import { Redis } from '@upstash/redis';
+import { MessageStorage } from 'serverless-queue';
+import type { StoredMessage, MessageState } from 'serverless-queue';
+
+const redis = new Redis({
+  url: process.env.UPSTASH_REDIS_REST_URL!,
+  token: process.env.UPSTASH_REDIS_REST_TOKEN!,
+});
+
+// Key helpers
+const msgKey = (id: string) => `sq:msg:${id}`;
+const queueKey = (queueId: string) => `sq:queue:${queueId}`;
+
+export class RedisStorage extends MessageStorage {
+  async readMessage(id: string): Promise<StoredMessage | null> {
+    const data = await redis.hgetall<Record<string, string>>(msgKey(id));
+    if (!data) return null;
+    return {
+      id: data.id,
+      queueId: data.queueId,
+      message: data.message,
+      timestamp: Number(data.timestamp),
+      state: data.state as StoredMessage['state'],
+    };
+  }
+
+  async writeMessage(msg: StoredMessage): Promise<void> {
+    const pipeline = redis.pipeline();
+    pipeline.hset(msgKey(msg.id), {
+      id: msg.id,
+      queueId: msg.queueId,
+      message: msg.message,
+      timestamp: String(msg.timestamp),
+      state: msg.state,
+    });
+    // Add to sorted set, score = timestamp (for ordering)
+    pipeline.zadd(queueKey(msg.queueId), {
+      score: msg.timestamp,
+      member: msg.id,
+    });
+    await pipeline.exec();
+  }
+
+  async updateMessage(msg: StoredMessage): Promise<void> {
+    await redis.hset(msgKey(msg.id), {
+      message: msg.message,
+      state: msg.state,
+    });
+  }
+
+  async deleteMessage(id: string): Promise<void> {
+    const existing = await this.readMessage(id);
+    if (!existing) return;
+    const pipeline = redis.pipeline();
+    pipeline.del(msgKey(id));
+    pipeline.zrem(queueKey(existing.queueId), id);
+    await pipeline.exec();
+  }
+
+  async readLastMessageByQueue(queueId: string): Promise<StoredMessage | null> {
+    // Get the member with the highest score (most recent timestamp)
+    const ids = await redis.zrange<string[]>(queueKey(queueId), 0, 0, {
+      rev: true,
+    });
+    if (!ids.length) return null;
+    return this.readMessage(ids[0]!);
+  }
+
+  async readMessagesByQueue(
+    queueId: string,
+    state?: MessageState,
+    limit = 100,
+  ): Promise<StoredMessage[]> {
+    // Get all IDs ordered by timestamp ASC
+    const ids = await redis.zrange<string[]>(queueKey(queueId), 0, -1);
+    if (!ids.length) return [];
+
+    const messages = await Promise.all(ids.map(id => this.readMessage(id)));
+    const valid = messages.filter((m): m is StoredMessage => m !== null);
+
+    const filtered = state ? valid.filter(m => m.state === state) : valid;
+    return filtered.slice(0, limit);
+  }
+
+  async readPendingMessages(queueId: string, limit: number): Promise<StoredMessage[]> {
+    return this.readMessagesByQueue(queueId, 'pending', limit);
+  }
+}
+```
+
+> ⚠️ **Warning:** The Redis implementation above fetches all IDs and filters in memory. For high-volume queues, consider storing state in the sorted set member or using a separate set per state for O(1) filtered reads.
+
+---
+
+## Cloudflare D1
+
+```ts
+import { MessageStorage } from 'serverless-queue';
+import type { StoredMessage, MessageState } from 'serverless-queue';
+
+export class D1Storage extends MessageStorage {
+  constructor(private db: D1Database) {
+    super();
+  }
+
+  async readMessage(id: string): Promise<StoredMessage | null> {
+    const row = await this.db
+      .prepare('SELECT id, queue_id as queueId, message, timestamp, state FROM queue_messages WHERE id = ? LIMIT 1')
+      .bind(id)
+      .first<StoredMessage>();
+    return row ?? null;
+  }
+
+  async writeMessage(msg: StoredMessage): Promise<void> {
+    await this.db
+      .prepare('INSERT INTO queue_messages (id, queue_id, message, timestamp, state) VALUES (?, ?, ?, ?, ?)')
+      .bind(msg.id, msg.queueId, msg.message, msg.timestamp, msg.state)
+      .run();
+  }
+
+  async updateMessage(msg: StoredMessage): Promise<void> {
+    await this.db
+      .prepare('UPDATE queue_messages SET message = ?, state = ? WHERE id = ?')
+      .bind(msg.message, msg.state, msg.id)
+      .run();
+  }
+
+  async deleteMessage(id: string): Promise<void> {
+    await this.db
+      .prepare('DELETE FROM queue_messages WHERE id = ?')
+      .bind(id)
+      .run();
+  }
+
+  async readLastMessageByQueue(queueId: string): Promise<StoredMessage | null> {
+    const row = await this.db
+      .prepare('SELECT id, queue_id as queueId, message, timestamp, state FROM queue_messages WHERE queue_id = ? ORDER BY timestamp DESC LIMIT 1')
+      .bind(queueId)
+      .first<StoredMessage>();
+    return row ?? null;
+  }
+
+  async readMessagesByQueue(
+    queueId: string,
+    state?: MessageState,
+    limit = 100,
+  ): Promise<StoredMessage[]> {
+    const stmt = state
+      ? this.db
+          .prepare('SELECT id, queue_id as queueId, message, timestamp, state FROM queue_messages WHERE queue_id = ? AND state = ? ORDER BY timestamp ASC LIMIT ?')
+          .bind(queueId, state, limit)
+      : this.db
+          .prepare('SELECT id, queue_id as queueId, message, timestamp, state FROM queue_messages WHERE queue_id = ? ORDER BY timestamp ASC LIMIT ?')
+          .bind(queueId, limit);
+    const { results } = await stmt.all<StoredMessage>();
+    return results;
+  }
+
+  async readPendingMessages(queueId: string, limit: number): Promise<StoredMessage[]> {
+    return this.readMessagesByQueue(queueId, 'pending', limit);
+  }
+}
+```
+
+D1 migration:
+
+```sql
+-- migrations/0001_create_queue_messages.sql
+CREATE TABLE queue_messages (
+  id        TEXT   PRIMARY KEY,
+  queue_id  TEXT   NOT NULL,
+  message   TEXT   NOT NULL,
+  timestamp INTEGER NOT NULL,
+  state     TEXT   NOT NULL DEFAULT 'pending'
+);
+
+CREATE INDEX idx_queue_messages_queue_id_timestamp
+  ON queue_messages (queue_id, timestamp DESC);
+```
+
+---
+
+## DynamoDB pattern hints
+
+For DynamoDB, use `queueId` as the partition key and `timestamp` (+ `id` for uniqueness) as the sort key. Use a **Global Secondary Index (GSI)** on `(queueId, state)` for efficient state-filtered queries.
+
+For the atomic `pending → processing` transition, use a `ConditionExpression`:
+
+```ts
+await dynamoClient.send(new UpdateItemCommand({
+  TableName: 'QueueMessages',
+  Key: { id: { S: msg.id } },
+  UpdateExpression: 'SET #state = :processing, #message = :message',
+  ConditionExpression: '#state = :pending',
+  ExpressionAttributeNames: {
+    '#state': 'state',
+    '#message': 'message',
+  },
+  ExpressionAttributeValues: {
+    ':processing': { S: 'processing' },
+    ':pending': { S: 'pending' },
+    ':message': { S: msg.message },
+  },
+}));
+// ConditionalCheckFailedException means another invocation won the race
+```

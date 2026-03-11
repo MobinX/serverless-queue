@@ -1,0 +1,402 @@
+---
+title: Node.js
+description: Full example for serverless-queue on Node.js with Express, better-sqlite3, and axios for self-invocation.
+---
+
+# Node.js / Express
+
+`serverless-queue` works equally well in a traditional Node.js server environment. This guide sets up a queue using **Express** as the HTTP layer, **better-sqlite3** for storage, and **axios** for self-invocations. It's also a great setup for local development when you don't want to deploy to a cloud platform.
+
+---
+
+## Install dependencies
+
+```bash
+npm install express better-sqlite3 axios serverless-queue
+npm install -D @types/express @types/better-sqlite3 tsx
+```
+
+---
+
+## Project structure
+
+```
+src/
+  queue/
+    types.ts
+    storage.ts
+    action.ts
+    invoker.ts
+    strategy.ts
+    index.ts
+  server.ts
+```
+
+---
+
+## Database setup
+
+```ts
+// src/queue/db.ts
+import Database from 'better-sqlite3';
+import path from 'path';
+
+export const db = new Database(path.join(process.cwd(), 'queue.db'));
+
+// Enable WAL mode for better concurrent read performance
+db.pragma('journal_mode = WAL');
+
+// Create the table and index on first run
+db.exec(`
+  CREATE TABLE IF NOT EXISTS queue_messages (
+    id        TEXT    PRIMARY KEY,
+    queue_id  TEXT    NOT NULL,
+    message   TEXT    NOT NULL,
+    timestamp INTEGER NOT NULL,
+    state     TEXT    NOT NULL DEFAULT 'pending'
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_queue_messages_queue_id_timestamp
+    ON queue_messages (queue_id, timestamp DESC);
+`);
+```
+
+---
+
+## `src/queue/types.ts`
+
+```ts
+export interface JobPayload {
+  type: 'send_report' | 'export_csv' | 'send_notification';
+  userId: string;
+  params: Record<string, unknown>;
+}
+```
+
+---
+
+## `src/queue/storage.ts`
+
+```ts
+import Database from 'better-sqlite3';
+import { MessageStorage } from 'serverless-queue';
+import type { StoredMessage, MessageState } from 'serverless-queue';
+import { db } from './db';
+
+export class SQLiteStorage extends MessageStorage {
+  async readMessage(id: string): Promise<StoredMessage | null> {
+    const row = db
+      .prepare(
+        'SELECT id, queue_id AS queueId, message, timestamp, state FROM queue_messages WHERE id = ? LIMIT 1',
+      )
+      .get(id) as StoredMessage | undefined;
+    return row ?? null;
+  }
+
+  async writeMessage(msg: StoredMessage): Promise<void> {
+    db.prepare(
+      'INSERT OR IGNORE INTO queue_messages (id, queue_id, message, timestamp, state) VALUES (?, ?, ?, ?, ?)',
+    ).run(msg.id, msg.queueId, msg.message, msg.timestamp, msg.state);
+  }
+
+  async updateMessage(msg: StoredMessage): Promise<void> {
+    if (msg.state === 'processing') {
+      // Conditional write: only update if still 'pending'
+      const result = db
+        .prepare(
+          "UPDATE queue_messages SET message = ?, state = ? WHERE id = ? AND state = 'pending'",
+        )
+        .run(msg.message, msg.state, msg.id);
+
+      if (result.changes === 0) {
+        throw new Error(`Race condition on message ${msg.id}: no longer pending`);
+      }
+    } else {
+      db.prepare(
+        'UPDATE queue_messages SET message = ?, state = ? WHERE id = ?',
+      ).run(msg.message, msg.state, msg.id);
+    }
+  }
+
+  async deleteMessage(id: string): Promise<void> {
+    db.prepare('DELETE FROM queue_messages WHERE id = ?').run(id);
+  }
+
+  async readLastMessageByQueue(queueId: string): Promise<StoredMessage | null> {
+    const row = db
+      .prepare(
+        'SELECT id, queue_id AS queueId, message, timestamp, state FROM queue_messages WHERE queue_id = ? ORDER BY timestamp DESC LIMIT 1',
+      )
+      .get(queueId) as StoredMessage | undefined;
+    return row ?? null;
+  }
+
+  async readMessagesByQueue(
+    queueId: string,
+    state?: MessageState,
+    limit = 50,
+  ): Promise<StoredMessage[]> {
+    if (state) {
+      return db
+        .prepare(
+          'SELECT id, queue_id AS queueId, message, timestamp, state FROM queue_messages WHERE queue_id = ? AND state = ? ORDER BY timestamp ASC LIMIT ?',
+        )
+        .all(queueId, state, limit) as StoredMessage[];
+    }
+    return db
+      .prepare(
+        'SELECT id, queue_id AS queueId, message, timestamp, state FROM queue_messages WHERE queue_id = ? ORDER BY timestamp ASC LIMIT ?',
+      )
+      .all(queueId, limit) as StoredMessage[];
+  }
+
+  async readPendingMessages(queueId: string, limit: number): Promise<StoredMessage[]> {
+    return this.readMessagesByQueue(queueId, 'pending', limit);
+  }
+}
+```
+
+> 💡 **Tip:** `better-sqlite3` is synchronous, but that's fine here — the `async` methods just wrap synchronous calls. SQLite with WAL mode handles concurrent reads well and the queue serialises writes by design.
+
+---
+
+## `src/queue/action.ts`
+
+```ts
+import { MessageAction } from 'serverless-queue';
+import type { QueueMessage } from 'serverless-queue';
+import type { JobPayload } from './types';
+
+export class JobAction extends MessageAction<JobPayload> {
+  async execute(messages: QueueMessage<JobPayload>[]): Promise<void> {
+    for (const msg of messages) {
+      console.log(`[job-queue] executing ${msg.payload.type}`, {
+        id: msg.id,
+        userId: msg.payload.userId,
+        attempt: msg.attempt,
+      });
+
+      switch (msg.payload.type) {
+        case 'send_report':
+          await this.sendReport(msg.payload.userId, msg.payload.params);
+          break;
+        case 'export_csv':
+          await this.exportCsv(msg.payload.userId, msg.payload.params);
+          break;
+        case 'send_notification':
+          await this.sendNotification(msg.payload.userId, msg.payload.params);
+          break;
+        default:
+          throw new Error(`Unknown job type: ${(msg.payload as JobPayload).type}`);
+      }
+    }
+  }
+
+  private async sendReport(userId: string, params: Record<string, unknown>): Promise<void> {
+    // Your implementation here
+    console.log('[job-queue] sending report', { userId, params });
+  }
+
+  private async exportCsv(userId: string, params: Record<string, unknown>): Promise<void> {
+    console.log('[job-queue] exporting CSV', { userId, params });
+  }
+
+  private async sendNotification(userId: string, params: Record<string, unknown>): Promise<void> {
+    console.log('[job-queue] sending notification', { userId, params });
+  }
+}
+```
+
+---
+
+## `src/queue/invoker.ts`
+
+```ts
+import axios from 'axios';
+import { MessageInvoker } from 'serverless-queue';
+import type { QueueMessage } from 'serverless-queue';
+import type { JobPayload } from './types';
+
+export class AxiosInvoker extends MessageInvoker<JobPayload> {
+  private readonly baseUrl: string;
+  private readonly secret: string;
+
+  constructor(baseUrl: string, secret: string) {
+    super();
+    this.baseUrl = baseUrl;
+    this.secret = secret;
+  }
+
+  async invoke(messages: QueueMessage<JobPayload>[]): Promise<void> {
+    await axios.post(`${this.baseUrl}/api/queue`, messages, {
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${this.secret}`,
+      },
+      timeout: 8_000,
+      // Don't throw on 4xx/5xx — we want to handle the status ourselves
+      validateStatus: () => true,
+    }).then(res => {
+      if (res.status !== 200) {
+        throw new Error(`Self-invoke failed: ${res.status}`);
+      }
+    });
+  }
+}
+```
+
+---
+
+## `src/queue/strategy.ts`
+
+```ts
+import { RetryStrategy } from 'serverless-queue';
+import type { QueueMessage } from 'serverless-queue';
+import type { JobPayload } from './types';
+
+export class JobRetryStrategy extends RetryStrategy<JobPayload> {
+  shouldRetry(_message: QueueMessage<JobPayload>, error: unknown): boolean {
+    if (error instanceof Error && error.message.startsWith('Unknown job type')) {
+      return false; // Programming error — don't retry
+    }
+    return true;
+  }
+
+  async onExhausted(message: QueueMessage<JobPayload>): Promise<void> {
+    console.error('[job-queue] message exhausted', {
+      id: message.id,
+      queueId: message.queueId,
+      type: message.payload.type,
+      attempt: message.attempt,
+    });
+  }
+}
+```
+
+---
+
+## `src/queue/index.ts`
+
+```ts
+import { MessageQueue } from 'serverless-queue';
+import type { QueueConfig } from 'serverless-queue';
+import { SQLiteStorage } from './storage';
+import { JobAction } from './action';
+import { AxiosInvoker } from './invoker';
+import { JobRetryStrategy } from './strategy';
+import type { JobPayload } from './types';
+
+const BASE_URL = process.env.SERVER_BASE_URL ?? 'http://localhost:3000';
+const QUEUE_SECRET = process.env.QUEUE_SECRET ?? 'dev-secret';
+
+const config: QueueConfig = {
+  batchSize: 5,
+  maxAttempts: 3,
+  invokeRetries: 3,
+  drainMode: 'individual',
+};
+
+export const jobQueue = new MessageQueue<JobPayload>(
+  new SQLiteStorage(),
+  new JobAction(),
+  new JobRetryStrategy(),
+  new AxiosInvoker(BASE_URL, QUEUE_SECRET),
+  config,
+);
+
+export type { JobPayload };
+```
+
+---
+
+## `src/server.ts`
+
+```ts
+import express from 'express';
+import { jobQueue } from './queue';
+import type { QueueMessage } from 'serverless-queue';
+import type { JobPayload } from './queue/types';
+
+const app = express();
+app.use(express.json());
+
+const QUEUE_SECRET = process.env.QUEUE_SECRET ?? 'dev-secret';
+
+// Queue handler
+app.post('/api/queue', async (req, res) => {
+  const auth = req.headers.authorization;
+  if (auth !== `Bearer ${QUEUE_SECRET}`) {
+    res.status(401).json({ error: 'Unauthorized' });
+    return;
+  }
+
+  const messages: QueueMessage<JobPayload>[] = req.body;
+  if (!Array.isArray(messages) || messages.length === 0) {
+    res.status(400).json({ error: 'Expected non-empty array' });
+    return;
+  }
+
+  await jobQueue.handle(messages);
+  res.json({ ok: true });
+});
+
+// Enqueue endpoint (example)
+app.post('/api/jobs', async (req, res) => {
+  const { userId, type, params } = req.body;
+
+  const message: QueueMessage<JobPayload> = {
+    id: crypto.randomUUID(),
+    queueId: userId,
+    payload: { userId, type, params },
+    attempt: 0,
+    createdAt: Date.now(),
+    type: 'new',
+  };
+
+  // POST to own queue endpoint
+  await fetch(`http://localhost:${PORT}/api/queue`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${QUEUE_SECRET}`,
+    },
+    body: JSON.stringify([message]),
+  });
+
+  res.json({ queued: true, id: message.id });
+});
+
+const PORT = Number(process.env.PORT ?? 3000);
+app.listen(PORT, () => {
+  console.log(`Server running at http://localhost:${PORT}`);
+});
+```
+
+---
+
+## Running locally
+
+```bash
+# Development (with auto-reload)
+npx tsx watch src/server.ts
+
+# Production
+npx tsx src/server.ts
+
+# Or compile first
+npx tsc && node dist/server.js
+```
+
+### Test it manually
+
+```bash
+# Enqueue a job
+curl -X POST http://localhost:3000/api/jobs \
+  -H 'Content-Type: application/json' \
+  -d '{"userId":"user_123","type":"send_report","params":{"reportId":"rpt_456"}}'
+
+# Check the database
+sqlite3 queue.db "SELECT id, queue_id, state FROM queue_messages ORDER BY timestamp DESC LIMIT 10;"
+```
+
+> 💡 **Tip:** SQLite is great for development and low-traffic production use. For higher throughput, swap `SQLiteStorage` for the [Postgres implementation](/storage#postgres-vercelpostgres) without changing any other code.

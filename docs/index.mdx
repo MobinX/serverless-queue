@@ -1,0 +1,125 @@
+---
+title: serverless-queue
+description: Turn any serverless function into a durable, self-orchestrating queue — no broker, no infrastructure.
+---
+
+# serverless-queue
+
+**Turn any serverless function into a durable, self-orchestrating queue.**
+
+No SQS. No RabbitMQ. No Redis streams. No long-running workers. Just your existing serverless function, your existing database, and a clever self-invocation pattern.
+
+---
+
+## The problem
+
+Serverless functions are stateless and short-lived. They can't run a background worker, they can't block waiting for a job, and they can't retry themselves without external help. The usual answer is to add a message broker (SQS, Pub/Sub, Upstash QStash…) — but that's another service to provision, another bill to pay, another thing to go wrong.
+
+**serverless-queue takes a different approach.** When your function needs to process work asynchronously, it writes the job to your existing database, then invokes *itself* over HTTP to process it. The database row acts as the lock, the queue, and the audit log all at once.
+
+---
+
+## How it works
+
+```
+Your API route
+     │
+     ▼
+┌─────────────────────────────────────────────┐
+│              MessageQueue.handle()           │
+│                                             │
+│  Incoming message                           │
+│       │                                     │
+│       ▼                                     │
+│  Is queue busy? ──YES──► write 'pending'    │
+│       │                       └── return    │
+│       NO                                    │
+│       │                                     │
+│       ▼                                     │
+│  write 'pending'                            │
+│  promote to 'processing'                    │
+│  execute action                             │
+│       │                                     │
+│    ┌──┴──┐                                  │
+│  done   error                               │
+│    │      │                                 │
+│    │    retry? ──YES──► selfInvoke (retry)  │
+│    │      │                                 │
+│    │      NO                                │
+│    │      │                                 │
+│    │   onExhausted()                        │
+│    │   mark 'failed'                        │
+│    │      │                                 │
+│    └──────┘                                 │
+│         │                                   │
+│    drainPending() ──► selfInvoke (flush)    │
+└─────────────────────────────────────────────┘
+```
+
+The function returns HTTP 200 in every case — so the platform never retries on its own. All retry logic lives inside the library.
+
+---
+
+## Features
+
+- **Zero infrastructure** — no message broker, no extra services; works with any database you already have
+- **Durable by default** — messages are persisted before any processing begins; nothing is lost on crash
+- **Per-queue serialisation** — partition by `queueId` (userId, tenantId, orderId); queues are independent
+- **Configurable retries** — plug in any retry strategy: exponential back-off, error-type filtering, circuit breakers
+- **Dead-letter support** — `onExhausted` hook fires when retries run out; push to DLQ, send alerts, log to observability platforms
+- **Drain modes** — `individual` (default, parallel per-message) or `bulk` (single HTTP call for a batch)
+- **Platform-agnostic** — works on Vercel, Cloudflare Workers, AWS Lambda, Fly.io, or any Node.js server
+- **Fully typed** — generic over your payload type; end-to-end TypeScript inference
+- **Tiny & treeshakeable** — no runtime dependencies beyond your own DB client
+
+---
+
+## Architecture at a glance
+
+```
+┌──────────┐    POST /api/queue     ┌──────────────────────────┐
+│  Client  │ ──────────────────────► │   Serverless Function    │
+└──────────┘                         │                          │
+                                      │   MessageQueue.handle()  │
+                                      │          │               │
+                                      │          ▼               │
+                                      │   ┌────────────┐         │
+                                      │   │  Database  │         │
+                                      │   │ (your own) │         │
+                                      │   └────────────┘         │
+                                      │          │               │
+                                      │    selfInvoke()           │
+                                      │    (fire-and-forget)      │
+                                      └──────────┬───────────────┘
+                                                 │
+                                          POST /api/queue
+                                          (self-invoke)
+                                                 │
+                                                 ▼
+                                      ┌──────────────────────────┐
+                                      │   Same Function Again    │
+                                      │   (next message / retry) │
+                                      └──────────────────────────┘
+```
+
+The only "infrastructure" is your database. The function is both the producer and the consumer.
+
+---
+
+## Quick install
+
+```bash
+npm install serverless-queue
+# or
+bun add serverless-queue
+```
+
+---
+
+## Next steps
+
+- [Getting Started](/getting-started) — wire up a queue in 5 minutes
+- [Concepts](/concepts) — understand the message lifecycle and busy-lock mechanism
+- [Configuration](/configuration) — tune `batchSize`, `maxAttempts`, `drainMode`
+- [Storage](/storage) — implement `MessageStorage` for Postgres, Redis, D1, SQLite
+- [Platforms](/platforms/nextjs) — drop-in examples for Next.js, Cloudflare Workers, Node.js

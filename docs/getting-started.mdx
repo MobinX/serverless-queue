@@ -1,0 +1,329 @@
+---
+title: Getting Started
+description: Install serverless-queue and wire up a minimal queue in under 5 minutes.
+---
+
+# Getting Started
+
+This guide walks you through installing the library and wiring up a minimal email queue using **Next.js App Router** as the platform. The same pattern applies to any serverless runtime — see the [platform guides](/platforms/nextjs) for platform-specific details.
+
+---
+
+## Install
+
+```bash
+npm install serverless-queue
+# or
+bun add serverless-queue
+# or
+pnpm add serverless-queue
+```
+
+> 📝 **Note:** `serverless-queue` has zero runtime dependencies. You bring your own database client and HTTP transport.
+
+---
+
+## What you'll build
+
+A queue that sends transactional emails. When a request comes in:
+
+1. The message is persisted to your database as `pending`
+2. If the queue is idle, it immediately starts processing
+3. If the queue is busy, the message waits — and is drained automatically when the current job finishes
+4. On failure, the library retries up to `maxAttempts` times before calling `onExhausted`
+
+---
+
+## Quickstart: Email queue in Next.js
+
+### 1. Define your payload type
+
+```ts
+// lib/queue/types.ts
+export interface EmailPayload {
+  to: string;
+  subject: string;
+  html: string;
+}
+```
+
+### 2. Implement storage
+
+```ts
+// lib/queue/storage.ts
+import { sql } from '@vercel/postgres';
+import { MessageStorage } from 'serverless-queue';
+import type { StoredMessage, MessageState } from 'serverless-queue';
+
+export class PostgresMessageStorage extends MessageStorage {
+  async readMessage(id: string): Promise<StoredMessage | null> {
+    const { rows } = await sql`
+      SELECT id, queue_id AS "queueId", message, timestamp, state
+      FROM queue_messages
+      WHERE id = ${id}
+      LIMIT 1
+    `;
+    return (rows[0] as StoredMessage) ?? null;
+  }
+
+  async writeMessage(msg: StoredMessage): Promise<void> {
+    await sql`
+      INSERT INTO queue_messages (id, queue_id, message, timestamp, state)
+      VALUES (${msg.id}, ${msg.queueId}, ${msg.message}, ${msg.timestamp}, ${msg.state})
+    `;
+  }
+
+  async updateMessage(msg: StoredMessage): Promise<void> {
+    await sql`
+      UPDATE queue_messages
+      SET message = ${msg.message}, state = ${msg.state}
+      WHERE id = ${msg.id}
+    `;
+  }
+
+  async deleteMessage(id: string): Promise<void> {
+    await sql`DELETE FROM queue_messages WHERE id = ${id}`;
+  }
+
+  async readLastMessageByQueue(queueId: string): Promise<StoredMessage | null> {
+    const { rows } = await sql`
+      SELECT id, queue_id AS "queueId", message, timestamp, state
+      FROM queue_messages
+      WHERE queue_id = ${queueId}
+      ORDER BY timestamp DESC
+      LIMIT 1
+    `;
+    return (rows[0] as StoredMessage) ?? null;
+  }
+
+  async readMessagesByQueue(
+    queueId: string,
+    state?: MessageState,
+    limit?: number,
+  ): Promise<StoredMessage[]> {
+    const { rows } = state
+      ? await sql`
+          SELECT id, queue_id AS "queueId", message, timestamp, state
+          FROM queue_messages
+          WHERE queue_id = ${queueId} AND state = ${state}
+          ORDER BY timestamp ASC
+          LIMIT ${limit ?? 100}
+        `
+      : await sql`
+          SELECT id, queue_id AS "queueId", message, timestamp, state
+          FROM queue_messages
+          WHERE queue_id = ${queueId}
+          ORDER BY timestamp ASC
+          LIMIT ${limit ?? 100}
+        `;
+    return rows as StoredMessage[];
+  }
+
+  async readPendingMessages(queueId: string, limit: number): Promise<StoredMessage[]> {
+    return this.readMessagesByQueue(queueId, 'pending', limit);
+  }
+}
+```
+
+### 3. Implement the action
+
+```ts
+// lib/queue/action.ts
+import { Resend } from 'resend';
+import { MessageAction } from 'serverless-queue';
+import type { QueueMessage } from 'serverless-queue';
+import type { EmailPayload } from './types';
+
+const resend = new Resend(process.env.RESEND_API_KEY!);
+
+export class SendEmailAction extends MessageAction<EmailPayload> {
+  async execute(messages: QueueMessage<EmailPayload>[]): Promise<void> {
+    for (const msg of messages) {
+      const { error } = await resend.emails.send({
+        from: 'notifications@yourdomain.com',
+        to: msg.payload.to,
+        subject: msg.payload.subject,
+        html: msg.payload.html,
+      });
+      if (error) throw new Error(error.message);
+    }
+  }
+}
+```
+
+### 4. Implement the invoker
+
+```ts
+// lib/queue/invoker.ts
+import { MessageInvoker } from 'serverless-queue';
+import type { QueueMessage } from 'serverless-queue';
+import type { EmailPayload } from './types';
+
+export class FetchInvoker extends MessageInvoker<EmailPayload> {
+  async invoke(messages: QueueMessage<EmailPayload>[]): Promise<void> {
+    const res = await fetch(`${process.env.QUEUE_BASE_URL}/api/queue`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${process.env.QUEUE_SECRET}`,
+      },
+      body: JSON.stringify(messages),
+    });
+    if (!res.ok) throw new Error(`Self-invoke failed: ${res.status}`);
+  }
+}
+```
+
+### 5. Implement the retry strategy
+
+```ts
+// lib/queue/strategy.ts
+import { RetryStrategy } from 'serverless-queue';
+import type { QueueMessage } from 'serverless-queue';
+import type { EmailPayload } from './types';
+
+export class EmailRetryStrategy extends RetryStrategy<EmailPayload> {
+  shouldRetry(_message: QueueMessage<EmailPayload>, error: unknown): boolean {
+    // Retry everything except explicit "do not retry" signals
+    if (error instanceof Error && error.message.includes('Invalid email')) {
+      return false;
+    }
+    return true;
+  }
+
+  async onExhausted(message: QueueMessage<EmailPayload>): Promise<void> {
+    console.error('[queue] message exhausted', {
+      id: message.id,
+      queueId: message.queueId,
+      attempt: message.attempt,
+      payload: message.payload,
+    });
+  }
+}
+```
+
+### 6. Wire up the queue singleton
+
+```ts
+// lib/queue/index.ts
+import { MessageQueue } from 'serverless-queue';
+import type { QueueConfig } from 'serverless-queue';
+import { PostgresMessageStorage } from './storage';
+import { SendEmailAction } from './action';
+import { FetchInvoker } from './invoker';
+import { EmailRetryStrategy } from './strategy';
+import type { EmailPayload } from './types';
+
+const config: QueueConfig = {
+  batchSize: 5,
+  maxAttempts: 3,
+  invokeRetries: 3,
+  drainMode: 'individual',
+};
+
+export const emailQueue = new MessageQueue<EmailPayload>(
+  new PostgresMessageStorage(),
+  new SendEmailAction(),
+  new EmailRetryStrategy(),
+  new FetchInvoker(),
+  config,
+);
+```
+
+### 7. Create the API route
+
+```ts
+// app/api/queue/route.ts
+import { NextRequest, NextResponse } from 'next/server';
+import { emailQueue } from '@/lib/queue';
+import type { QueueMessage } from 'serverless-queue';
+import type { EmailPayload } from '@/lib/queue/types';
+
+export async function POST(req: NextRequest): Promise<NextResponse> {
+  // Verify the shared secret to block unauthorized invocations
+  const auth = req.headers.get('authorization');
+  if (auth !== `Bearer ${process.env.QUEUE_SECRET}`) {
+    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+  }
+
+  const messages: QueueMessage<EmailPayload>[] = await req.json();
+  await emailQueue.handle(messages);
+
+  // Always return 200 — the queue handles retries internally
+  return NextResponse.json({ ok: true });
+}
+```
+
+### 8. Enqueue a message
+
+From anywhere in your application:
+
+```ts
+// app/api/send-welcome/route.ts
+import { NextRequest, NextResponse } from 'next/server';
+import type { QueueMessage } from 'serverless-queue';
+import type { EmailPayload } from '@/lib/queue/types';
+
+export async function POST(req: NextRequest): Promise<NextResponse> {
+  const { userId, email } = await req.json();
+
+  const message: QueueMessage<EmailPayload> = {
+    id: crypto.randomUUID(),
+    queueId: userId,           // one serial queue per user
+    payload: {
+      to: email,
+      subject: 'Welcome!',
+      html: '<h1>Welcome to our platform.</h1>',
+    },
+    attempt: 0,
+    createdAt: Date.now(),
+    type: 'new',
+  };
+
+  await fetch(`${process.env.QUEUE_BASE_URL}/api/queue`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${process.env.QUEUE_SECRET}`,
+    },
+    body: JSON.stringify([message]),
+  });
+
+  return NextResponse.json({ queued: true });
+}
+```
+
+### 9. Database migration
+
+Create the messages table with the required composite index:
+
+```sql
+CREATE TABLE queue_messages (
+  id        TEXT PRIMARY KEY,
+  queue_id  TEXT        NOT NULL,
+  message   TEXT        NOT NULL,
+  timestamp BIGINT      NOT NULL,
+  state     TEXT        NOT NULL DEFAULT 'pending'
+);
+
+CREATE INDEX idx_queue_messages_queue_id_timestamp
+  ON queue_messages (queue_id, timestamp DESC);
+```
+
+### 10. Environment variables
+
+```env
+QUEUE_BASE_URL=https://your-app.vercel.app
+QUEUE_SECRET=a-long-random-secret
+RESEND_API_KEY=re_...
+POSTGRES_URL=postgres://...
+```
+
+---
+
+## Next steps
+
+- [Concepts](/concepts) — understand the message lifecycle in depth
+- [Configuration](/configuration) — tune batching, retries, and drain modes
+- [Next.js platform guide](/platforms/nextjs) — production-ready example with full error handling
+- [Dead-letter queue recipe](/recipes/dead-letter-queue) — handle exhausted messages

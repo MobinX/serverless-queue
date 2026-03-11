@@ -1,0 +1,258 @@
+---
+title: Recovery Cron
+description: Detect stuck messages and requeue them with a cron job — for Vercel and Cloudflare Workers scheduled events.
+---
+
+# Recovery Cron
+
+Messages can get stuck in the `processing` state if a serverless function crashes mid-execution or if all `invokeRetries` are exhausted after a network partition. No new invocation will pick them up because the queue thinks they're still being processed.
+
+A recovery cron job scans for these stuck messages and re-invokes them.
+
+---
+
+## Why messages get stuck
+
+```
+Invocation starts
+       │
+  promote to 'processing'
+       │
+  [function crashes / OOM / timeout]  ← stuck here
+       │
+  state remains 'processing' forever
+       │
+  isBusy() → true for new messages
+  queue is effectively blocked
+```
+
+The two scenarios:
+
+1. **Function crash/timeout** — the invocation dies before it can update the state to `done` or `failed`
+2. **Invoke retry exhaustion** — `selfInvoke` failed after all `invokeRetries`, leaving the message in `processing` with no active invocation running
+
+In both cases, the message is permanently stuck until something external detects and re-queues it.
+
+---
+
+## Detection query
+
+Find messages that have been in `processing` state for longer than a configured threshold:
+
+```sql
+-- PostgreSQL: messages stuck in 'processing' for more than 5 minutes
+SELECT id, queue_id, timestamp, state
+FROM queue_messages
+WHERE state = 'processing'
+  AND timestamp < EXTRACT(EPOCH FROM NOW() - INTERVAL '5 minutes') * 1000;
+```
+
+The threshold should be larger than your maximum expected function duration. If your queue function has `maxDuration: 60`, use a threshold of at least 2–3× that (e.g. 3 minutes) to avoid false positives from slow-but-running invocations.
+
+---
+
+## Vercel cron: recovery job
+
+```ts
+// app/api/cron/queue-recovery/route.ts
+import { sql } from '@vercel/postgres';
+import { NextResponse } from 'next/server';
+import type { QueueMessage } from 'serverless-queue';
+
+export const dynamic = 'force-dynamic';
+
+// Threshold: messages stuck longer than this are considered abandoned
+const STUCK_THRESHOLD_MS = 5 * 60 * 1000; // 5 minutes
+
+export async function GET(req: Request): Promise<NextResponse> {
+  // Protect the cron endpoint (Vercel sets this header automatically)
+  const authHeader = req.headers.get('authorization');
+  if (authHeader !== `Bearer ${process.env.CRON_SECRET}`) {
+    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+  }
+
+  const stuckBefore = Date.now() - STUCK_THRESHOLD_MS;
+
+  // Find all stuck messages
+  const { rows } = await sql`
+    SELECT id, queue_id AS "queueId", message, timestamp, state
+    FROM queue_messages
+    WHERE state = 'processing'
+      AND timestamp < ${stuckBefore}
+    ORDER BY timestamp ASC
+    LIMIT 50
+  `;
+
+  if (rows.length === 0) {
+    return NextResponse.json({ recovered: 0 });
+  }
+
+  console.log(`[recovery-cron] found ${rows.length} stuck messages`);
+
+  let recovered = 0;
+
+  for (const row of rows) {
+    try {
+      const original = JSON.parse(row.message) as QueueMessage<unknown>;
+
+      // Re-enqueue as a fresh 'retry' — preserves the attempt count
+      const message: QueueMessage<unknown> = {
+        ...original,
+        type: 'retry',
+      };
+
+      // Reset state to 'pending' before re-invoking
+      await sql`
+        UPDATE queue_messages
+        SET state = 'pending'
+        WHERE id = ${row.id} AND state = 'processing'
+      `;
+
+      const res = await fetch(`${process.env.QUEUE_BASE_URL}/api/queue`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${process.env.QUEUE_SECRET}`,
+        },
+        body: JSON.stringify([message]),
+      });
+
+      if (res.ok) {
+        recovered++;
+        console.log(`[recovery-cron] recovered message ${row.id}`);
+      } else {
+        console.error(`[recovery-cron] failed to re-invoke ${row.id}: ${res.status}`);
+      }
+    } catch (err) {
+      console.error(`[recovery-cron] error recovering ${row.id}`, err);
+    }
+  }
+
+  return NextResponse.json({ recovered, total: rows.length });
+}
+```
+
+Register the cron in `vercel.json`:
+
+```json
+{
+  "crons": [
+    {
+      "path": "/api/cron/queue-recovery",
+      "schedule": "*/5 * * * *"
+    }
+  ]
+}
+```
+
+> 📝 **Note:** Vercel automatically sets `Authorization: Bearer <CRON_SECRET>` on cron requests when `CRON_SECRET` is in your environment. See the [Vercel Cron Jobs docs](https://vercel.com/docs/cron-jobs) for setup.
+
+---
+
+## Cloudflare Workers: scheduled handler
+
+```ts
+// src/index.ts — add a scheduled handler alongside the fetch handler
+import type { QueueMessage } from 'serverless-queue';
+
+interface Env {
+  DB: D1Database;
+  SELF: Fetcher;
+  QUEUE_SECRET: string;
+}
+
+const STUCK_THRESHOLD_MS = 5 * 60 * 1000; // 5 minutes
+
+export default {
+  async fetch(request: Request, env: Env): Promise<Response> {
+    // ... existing fetch handler
+    return new Response('ok');
+  },
+
+  async scheduled(_event: ScheduledEvent, env: Env): Promise<void> {
+    const stuckBefore = Date.now() - STUCK_THRESHOLD_MS;
+
+    const { results: stuck } = await env.DB
+      .prepare(
+        'SELECT id, queue_id AS queueId, message FROM queue_messages WHERE state = ? AND timestamp < ? LIMIT 50',
+      )
+      .bind('processing', stuckBefore)
+      .all<{ id: string; queueId: string; message: string }>();
+
+    if (stuck.length === 0) return;
+
+    console.log(`[recovery-cron] found ${stuck.length} stuck messages`);
+
+    for (const row of stuck) {
+      try {
+        const original = JSON.parse(row.message) as QueueMessage<unknown>;
+        const message: QueueMessage<unknown> = { ...original, type: 'retry' };
+
+        // Reset to pending
+        await env.DB
+          .prepare("UPDATE queue_messages SET state = 'pending' WHERE id = ? AND state = 'processing'")
+          .bind(row.id)
+          .run();
+
+        // Re-invoke via SELF binding
+        await env.SELF.fetch('https://worker/api/queue', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${env.QUEUE_SECRET}`,
+          },
+          body: JSON.stringify([message]),
+        });
+
+        console.log(`[recovery-cron] recovered ${row.id}`);
+      } catch (err) {
+        console.error(`[recovery-cron] failed to recover ${row.id}`, err);
+      }
+    }
+  },
+};
+```
+
+Register the schedule in `wrangler.toml`:
+
+```toml
+[triggers]
+crons = ["*/5 * * * *"]
+```
+
+---
+
+## Choosing a stuck threshold
+
+| Function `maxDuration` | Recommended threshold |
+|------------------------|-----------------------|
+| 10 seconds (Vercel Hobby) | 2 minutes |
+| 60 seconds (Vercel Pro) | 5 minutes |
+| 300 seconds (Vercel Pro max) | 15 minutes |
+| 30ms (Cloudflare Workers CPU limit) | 2 minutes |
+
+> ⚠️ **Warning:** Set the threshold too low and the cron job will re-invoke messages that are still actively processing — causing double-execution. The conditional update (`WHERE state = 'processing'`) prevents the duplicate from winning the lock, but it adds unnecessary load. Set it conservatively.
+
+---
+
+## Monitoring stuck messages
+
+Add a query to your observability dashboard:
+
+```sql
+-- PostgreSQL: stuck message counts by age bucket
+SELECT
+  CASE
+    WHEN NOW() - to_timestamp(timestamp / 1000) < INTERVAL '5 minutes' THEN '< 5 min'
+    WHEN NOW() - to_timestamp(timestamp / 1000) < INTERVAL '1 hour'    THEN '5min – 1hr'
+    WHEN NOW() - to_timestamp(timestamp / 1000) < INTERVAL '1 day'     THEN '1hr – 1day'
+    ELSE '> 1 day'
+  END AS age_bucket,
+  COUNT(*) AS count
+FROM queue_messages
+WHERE state = 'processing'
+GROUP BY age_bucket
+ORDER BY count DESC;
+```
+
+An alert on `count > 0` for the `'> 1 day'` bucket means your recovery cron itself might be broken.

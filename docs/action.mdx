@@ -1,0 +1,256 @@
+---
+title: Action
+description: Implement MessageAction to define the business logic executed for each queue message.
+---
+
+# Action
+
+`MessageAction<T>` is where your business logic lives. It receives an array of `QueueMessage<T>` envelopes and does the work — sending emails, calling webhooks, writing to a database, or anything else.
+
+---
+
+## Interface
+
+```ts
+import { MessageAction } from 'serverless-queue';
+import type { QueueMessage } from 'serverless-queue';
+
+export abstract class MessageAction<T = unknown> {
+  abstract execute(messages: QueueMessage<T>[]): Promise<void>;
+}
+```
+
+**Throw any error to signal failure.** The orchestrator catches it and passes control to your `RetryStrategy`. If you swallow errors, the message will be marked `done` even if the work failed.
+
+---
+
+## Batch semantics
+
+`execute` always receives an **array** of messages. The size of the array depends on `drainMode`:
+
+| `drainMode` | Array size |
+|-------------|------------|
+| `'individual'` (default) | Always `[msg]` — a single message |
+| `'bulk'` | Up to `batchSize` messages |
+
+Design your action with this in mind:
+
+```ts
+async execute(messages: QueueMessage<MyPayload>[]): Promise<void> {
+  // Works correctly for both drainMode: 'individual' and 'bulk'
+  for (const msg of messages) {
+    await doWork(msg.payload);
+  }
+}
+```
+
+If you're using `bulk` mode to optimise a batch operation, you can take advantage of the full array:
+
+```ts
+async execute(messages: QueueMessage<MyPayload>[]): Promise<void> {
+  const payloads = messages.map(m => m.payload);
+  await db.insertMany(payloads); // one DB round-trip for the whole batch
+}
+```
+
+---
+
+## Example: Send email (Resend)
+
+### Minimal
+
+```ts
+import { Resend } from 'resend';
+import { MessageAction } from 'serverless-queue';
+import type { QueueMessage } from 'serverless-queue';
+
+interface EmailPayload {
+  to: string;
+  subject: string;
+  html: string;
+}
+
+const resend = new Resend(process.env.RESEND_API_KEY!);
+
+export class SendEmailAction extends MessageAction<EmailPayload> {
+  async execute(messages: QueueMessage<EmailPayload>[]): Promise<void> {
+    for (const msg of messages) {
+      const { error } = await resend.emails.send({
+        from: 'noreply@yourdomain.com',
+        to: msg.payload.to,
+        subject: msg.payload.subject,
+        html: msg.payload.html,
+      });
+      if (error) throw new Error(`Resend error: ${error.message}`);
+    }
+  }
+}
+```
+
+### Production-grade (with logging and attempt-aware logic)
+
+```ts
+import { Resend } from 'resend';
+import { MessageAction } from 'serverless-queue';
+import type { QueueMessage } from 'serverless-queue';
+
+interface EmailPayload {
+  to: string;
+  subject: string;
+  html: string;
+  replyTo?: string;
+}
+
+const resend = new Resend(process.env.RESEND_API_KEY!);
+
+export class SendEmailAction extends MessageAction<EmailPayload> {
+  async execute(messages: QueueMessage<EmailPayload>[]): Promise<void> {
+    for (const msg of messages) {
+      console.log('[email-action] sending', {
+        id: msg.id,
+        to: msg.payload.to,
+        attempt: msg.attempt,
+      });
+
+      const { data, error } = await resend.emails.send({
+        from: 'noreply@yourdomain.com',
+        to: msg.payload.to,
+        subject: msg.payload.subject,
+        html: msg.payload.html,
+        ...(msg.payload.replyTo ? { replyTo: msg.payload.replyTo } : {}),
+        headers: {
+          // Idempotency key — prevents Resend from sending duplicates on retry
+          'X-Queue-Message-Id': msg.id,
+        },
+      });
+
+      if (error) {
+        console.error('[email-action] send failed', { id: msg.id, error });
+        throw new Error(`Resend API error: ${error.message}`);
+      }
+
+      console.log('[email-action] sent', { id: msg.id, emailId: data?.id });
+    }
+  }
+}
+```
+
+---
+
+## Example: Call external webhook
+
+```ts
+import { MessageAction } from 'serverless-queue';
+import type { QueueMessage } from 'serverless-queue';
+
+interface WebhookPayload {
+  event: string;
+  data: Record<string, unknown>;
+  targetUrl: string;
+}
+
+export class WebhookAction extends MessageAction<WebhookPayload> {
+  async execute(messages: QueueMessage<WebhookPayload>[]): Promise<void> {
+    for (const msg of messages) {
+      const { event, data, targetUrl } = msg.payload;
+
+      const res = await fetch(targetUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          event,
+          data,
+          messageId: msg.id,
+          timestamp: msg.createdAt,
+        }),
+        signal: AbortSignal.timeout(10_000), // 10-second timeout
+      });
+
+      if (!res.ok) {
+        throw new Error(`Webhook delivery failed: ${res.status} ${res.statusText}`);
+      }
+    }
+  }
+}
+```
+
+---
+
+## Example: Database write (bulk-optimised)
+
+This action is designed for `drainMode: 'bulk'` — it writes all messages in a single transaction.
+
+```ts
+import { sql } from '@vercel/postgres';
+import { MessageAction } from 'serverless-queue';
+import type { QueueMessage } from 'serverless-queue';
+
+interface AuditEventPayload {
+  userId: string;
+  action: string;
+  resourceId: string;
+  metadata: Record<string, unknown>;
+}
+
+export class AuditLogAction extends MessageAction<AuditEventPayload> {
+  async execute(messages: QueueMessage<AuditEventPayload>[]): Promise<void> {
+    if (messages.length === 0) return;
+
+    // Build a bulk insert — one DB round-trip regardless of batch size
+    const values = messages.map(msg =>
+      `('${msg.id}', '${msg.payload.userId}', '${msg.payload.action}', '${msg.payload.resourceId}', '${JSON.stringify(msg.payload.metadata).replace(/'/g, "''")}', to_timestamp(${msg.createdAt} / 1000.0))`
+    ).join(', ');
+
+    await sql.query(`
+      INSERT INTO audit_events (id, user_id, action, resource_id, metadata, created_at)
+      VALUES ${values}
+      ON CONFLICT (id) DO NOTHING
+    `);
+  }
+}
+```
+
+> ⚠️ **Warning:** The inline SQL above is for illustration. In production, use parameterised queries or a query builder to prevent SQL injection.
+
+---
+
+## Example: Idempotent writes
+
+When retries are involved, your action may be called more than once with the same message. Use the `msg.id` as an idempotency key:
+
+```ts
+import { MessageAction } from 'serverless-queue';
+import type { QueueMessage } from 'serverless-queue';
+
+interface OrderPayload {
+  orderId: string;
+  customerId: string;
+  items: Array<{ sku: string; qty: number }>;
+}
+
+export class ProcessOrderAction extends MessageAction<OrderPayload> {
+  async execute(messages: QueueMessage<OrderPayload>[]): Promise<void> {
+    for (const msg of messages) {
+      // Use message ID as idempotency key so retries don't create duplicate orders
+      const existing = await db.orders.findUnique({
+        where: { idempotencyKey: msg.id },
+      });
+
+      if (existing) {
+        console.log('[order-action] already processed, skipping', msg.id);
+        continue;
+      }
+
+      await db.orders.create({
+        data: {
+          idempotencyKey: msg.id,
+          customerId: msg.payload.customerId,
+          items: msg.payload.items,
+        },
+      });
+    }
+  }
+}
+```
+
+> 💡 **Tip:** Always design your actions to be **idempotent** — safe to run multiple times with the same message. The queue guarantees at-least-once delivery, not exactly-once.

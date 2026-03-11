@@ -1,0 +1,301 @@
+---
+title: Dead-Letter Queue
+description: Handle exhausted messages with a DLQ table, Slack alerts, and a monitoring dashboard query.
+---
+
+# Dead-Letter Queue
+
+When a message exhausts all retry attempts, `RetryStrategy.onExhausted` is your hook to handle it gracefully. This recipe shows how to build a complete DLQ (dead-letter queue) system with a dedicated table, Slack alerting, and monitoring queries.
+
+---
+
+## Why you need a DLQ
+
+Without a DLQ, exhausted messages are marked `'failed'` in your `queue_messages` table and silently disappear from the active queue. They're still in the DB, but there's no dedicated workflow to inspect, alert on, or replay them.
+
+A proper DLQ gives you:
+
+- **Visibility** — know immediately when messages fail permanently
+- **Replay** — re-enqueue failed messages after fixing the underlying bug
+- **Auditing** — keep the full history of what failed and why
+
+---
+
+## Dead-letter table schema
+
+```sql
+CREATE TABLE dead_letter_messages (
+  id             TEXT PRIMARY KEY,
+  original_id    TEXT NOT NULL,
+  queue_id       TEXT NOT NULL,
+  payload        TEXT NOT NULL,       -- JSON-stringified original payload
+  final_attempt  INTEGER NOT NULL,
+  error_message  TEXT,
+  failed_at      BIGINT NOT NULL,
+  replayed_at    BIGINT,              -- set when the message is replayed
+  replayed_by    TEXT                 -- who/what triggered the replay
+);
+
+CREATE INDEX idx_dlq_queue_id ON dead_letter_messages (queue_id);
+CREATE INDEX idx_dlq_failed_at ON dead_letter_messages (failed_at DESC);
+```
+
+---
+
+## `onExhausted` implementation
+
+### With Postgres and Slack alert
+
+```ts
+import { sql } from '@vercel/postgres';
+import { RetryStrategy } from 'serverless-queue';
+import type { QueueMessage } from 'serverless-queue';
+
+interface EmailPayload {
+  to: string;
+  subject: string;
+  html: string;
+}
+
+export class EmailRetryStrategy extends RetryStrategy<EmailPayload> {
+  shouldRetry(_message: QueueMessage<EmailPayload>, error: unknown): boolean {
+    if (error instanceof Error && error.message.includes('Invalid `to` field')) {
+      return false; // Bad email address — retrying won't help
+    }
+    return true;
+  }
+
+  async onExhausted(message: QueueMessage<EmailPayload>): Promise<void> {
+    const failedAt = Date.now();
+
+    // 1. Persist to DLQ table
+    await sql`
+      INSERT INTO dead_letter_messages (
+        id, original_id, queue_id, payload, final_attempt, failed_at
+      )
+      VALUES (
+        ${crypto.randomUUID()},
+        ${message.id},
+        ${message.queueId},
+        ${JSON.stringify(message.payload)},
+        ${message.attempt},
+        ${failedAt}
+      )
+      ON CONFLICT (original_id) DO NOTHING
+    `;
+
+    // 2. Alert on Slack (fire-and-forget — don't block the queue)
+    this.alertSlack(message, failedAt).catch(err =>
+      console.error('[dlq] slack alert failed', err),
+    );
+
+    console.error('[dlq] message exhausted', {
+      id: message.id,
+      queueId: message.queueId,
+      to: message.payload.to,
+      attempt: message.attempt,
+    });
+  }
+
+  private async alertSlack(
+    message: QueueMessage<EmailPayload>,
+    failedAt: number,
+  ): Promise<void> {
+    if (!process.env.SLACK_WEBHOOK_URL) return;
+
+    await fetch(process.env.SLACK_WEBHOOK_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        text: [
+          `⚠️ *Queue message exhausted*`,
+          `• ID: \`${message.id}\``,
+          `• Queue: \`${message.queueId}\``,
+          `• To: ${message.payload.to}`,
+          `• Attempts: ${message.attempt + 1}`,
+          `• Failed at: <!date^${Math.floor(failedAt / 1000)}^{date_short_pretty} {time}|${new Date(failedAt).toISOString()}>`,
+        ].join('\n'),
+      }),
+    });
+  }
+}
+```
+
+---
+
+## Replaying dead-letter messages
+
+After fixing the bug that caused messages to exhaust, you can replay them:
+
+```ts
+// scripts/replay-dlq.ts
+import { sql } from '@vercel/postgres';
+import type { QueueMessage } from 'serverless-queue';
+
+interface EmailPayload {
+  to: string;
+  subject: string;
+  html: string;
+}
+
+async function replayDeadLetterMessages(queueId?: string): Promise<void> {
+  const { rows } = queueId
+    ? await sql`
+        SELECT id, original_id AS "originalId", queue_id AS "queueId", payload, final_attempt AS "finalAttempt"
+        FROM dead_letter_messages
+        WHERE replayed_at IS NULL AND queue_id = ${queueId}
+        ORDER BY failed_at ASC
+        LIMIT 100
+      `
+    : await sql`
+        SELECT id, original_id AS "originalId", queue_id AS "queueId", payload, final_attempt AS "finalAttempt"
+        FROM dead_letter_messages
+        WHERE replayed_at IS NULL
+        ORDER BY failed_at ASC
+        LIMIT 100
+      `;
+
+  console.log(`Replaying ${rows.length} dead-letter messages...`);
+
+  for (const row of rows) {
+    const payload = JSON.parse(row.payload) as EmailPayload;
+
+    // Re-enqueue as a fresh 'new' message
+    const message: QueueMessage<EmailPayload> = {
+      id: crypto.randomUUID(),  // new ID — fresh start
+      queueId: row.queueId,
+      payload,
+      attempt: 0,
+      createdAt: Date.now(),
+      type: 'new',
+    };
+
+    const res = await fetch(`${process.env.QUEUE_BASE_URL}/api/queue`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${process.env.QUEUE_SECRET}`,
+      },
+      body: JSON.stringify([message]),
+    });
+
+    if (!res.ok) {
+      console.error(`Failed to replay ${row.originalId}: ${res.status}`);
+      continue;
+    }
+
+    // Mark as replayed
+    await sql`
+      UPDATE dead_letter_messages
+      SET replayed_at = ${Date.now()}, replayed_by = 'manual-script'
+      WHERE id = ${row.id}
+    `;
+
+    console.log(`Replayed ${row.originalId} → new message ${message.id}`);
+  }
+}
+
+replayDeadLetterMessages().catch(console.error);
+```
+
+Run with:
+
+```bash
+npx tsx scripts/replay-dlq.ts
+```
+
+---
+
+## Monitoring queries
+
+### Messages in the DLQ in the last 24 hours
+
+```sql
+SELECT
+  queue_id,
+  COUNT(*) AS failed_count,
+  MAX(failed_at) AS last_failure
+FROM dead_letter_messages
+WHERE failed_at > EXTRACT(EPOCH FROM NOW() - INTERVAL '24 hours') * 1000
+  AND replayed_at IS NULL
+GROUP BY queue_id
+ORDER BY failed_count DESC;
+```
+
+### Full history for a specific queue
+
+```sql
+SELECT
+  original_id,
+  payload,
+  final_attempt,
+  to_timestamp(failed_at / 1000) AS failed_at,
+  CASE WHEN replayed_at IS NOT NULL
+    THEN to_timestamp(replayed_at / 1000)::text
+    ELSE 'not replayed'
+  END AS replayed_at
+FROM dead_letter_messages
+WHERE queue_id = 'user_abc'
+ORDER BY failed_at DESC;
+```
+
+### Total DLQ size by day
+
+```sql
+SELECT
+  DATE(to_timestamp(failed_at / 1000)) AS day,
+  COUNT(*) AS count
+FROM dead_letter_messages
+GROUP BY day
+ORDER BY day DESC
+LIMIT 30;
+```
+
+---
+
+## Vercel Cron: auto-alert on new DLQ entries
+
+```ts
+// app/api/cron/dlq-check/route.ts
+import { sql } from '@vercel/postgres';
+import { NextResponse } from 'next/server';
+
+export const dynamic = 'force-dynamic';
+
+export async function GET(): Promise<NextResponse> {
+  const fiveMinutesAgo = Date.now() - 5 * 60 * 1000;
+
+  const { rows } = await sql`
+    SELECT COUNT(*) AS count
+    FROM dead_letter_messages
+    WHERE failed_at > ${fiveMinutesAgo}
+      AND replayed_at IS NULL
+  `;
+
+  const newFailures = Number(rows[0]?.count ?? 0);
+
+  if (newFailures > 0) {
+    await fetch(process.env.SLACK_WEBHOOK_URL!, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        text: `🚨 ${newFailures} new dead-letter message(s) in the last 5 minutes. Check the DLQ.`,
+      }),
+    });
+  }
+
+  return NextResponse.json({ checked: true, newFailures });
+}
+```
+
+```json
+// vercel.json
+{
+  "crons": [
+    {
+      "path": "/api/cron/dlq-check",
+      "schedule": "*/5 * * * *"
+    }
+  ]
+}
+```

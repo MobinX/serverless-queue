@@ -1,0 +1,233 @@
+---
+title: Invoker
+description: Implement MessageInvoker to fire HTTP self-invocations back to your serverless function.
+---
+
+# Invoker
+
+`MessageInvoker<T>` is the transport layer. It sends an HTTP POST to your own serverless endpoint carrying one or more messages. This is what makes the queue self-orchestrating — the function invokes itself to process the next job.
+
+---
+
+## Interface
+
+```ts
+import { MessageInvoker } from 'serverless-queue';
+import type { QueueMessage } from 'serverless-queue';
+
+export abstract class MessageInvoker<T = unknown> {
+  abstract invoke(messages: QueueMessage<T>[]): Promise<void>;
+}
+```
+
+**Throw any error to signal that the invocation failed.** The orchestrator will retry up to `invokeRetries` times (default: 3). Do **not** swallow errors — if you catch and suppress them, the orchestrator thinks the invoke succeeded and won't retry.
+
+---
+
+## The self-invoke pattern
+
+When `invoke` is called, it fires an HTTP POST back to the same serverless function. The messages are serialised as a JSON array in the request body — the same format that your handler already receives from external callers.
+
+```
+Current invocation
+      │
+      │  invoker.invoke([msg])
+      │
+      ▼
+POST /api/queue
+Body: [{ id, queueId, payload, attempt, createdAt, type: 'retry' }]
+      │
+      ▼
+Next invocation
+(same function, new cold/warm start)
+```
+
+This is completely transparent to the orchestrator. From `MessageQueue`'s perspective, a self-invoked retry looks identical to a client-initiated message.
+
+---
+
+## Minimal implementation (native `fetch`)
+
+```ts
+import { MessageInvoker } from 'serverless-queue';
+import type { QueueMessage } from 'serverless-queue';
+
+export class FetchInvoker extends MessageInvoker {
+  async invoke(messages: QueueMessage[]): Promise<void> {
+    const res = await fetch(`${process.env.QUEUE_BASE_URL}/api/queue`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${process.env.QUEUE_SECRET}`,
+      },
+      body: JSON.stringify(messages),
+    });
+
+    if (!res.ok) {
+      throw new Error(`Self-invoke failed: ${res.status} ${res.statusText}`);
+    }
+  }
+}
+```
+
+---
+
+## Production-grade implementation
+
+```ts
+import { MessageInvoker } from 'serverless-queue';
+import type { QueueMessage } from 'serverless-queue';
+
+interface InvokerOptions {
+  queueUrl: string;
+  secret: string;
+  timeoutMs?: number;
+}
+
+export class FetchInvoker<T> extends MessageInvoker<T> {
+  private readonly queueUrl: string;
+  private readonly secret: string;
+  private readonly timeoutMs: number;
+
+  constructor(options: InvokerOptions) {
+    super();
+    this.queueUrl = options.queueUrl;
+    this.secret = options.secret;
+    this.timeoutMs = options.timeoutMs ?? 5_000;
+  }
+
+  async invoke(messages: QueueMessage<T>[]): Promise<void> {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), this.timeoutMs);
+
+    try {
+      const res = await fetch(this.queueUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${this.secret}`,
+          'X-Queue-Invoke': '1', // helps distinguish self-invokes in logs
+        },
+        body: JSON.stringify(messages),
+        signal: controller.signal,
+      });
+
+      if (!res.ok) {
+        const body = await res.text().catch(() => '');
+        throw new Error(`Self-invoke failed: ${res.status} ${res.statusText} — ${body}`);
+      }
+    } catch (err) {
+      if (err instanceof Error && err.name === 'AbortError') {
+        throw new Error(`Self-invoke timed out after ${this.timeoutMs}ms`);
+      }
+      throw err;
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+}
+
+// Usage
+export const invoker = new FetchInvoker({
+  queueUrl: `${process.env.QUEUE_BASE_URL}/api/queue`,
+  secret: process.env.QUEUE_SECRET!,
+  timeoutMs: 5_000,
+});
+```
+
+---
+
+## Cloudflare Workers: `env.SELF.fetch`
+
+On Cloudflare Workers you can avoid the external URL entirely and invoke the same worker using `env.SELF.fetch`. This is faster, cheaper (no egress), and works even in local development without knowing the deployed URL.
+
+```ts
+import { MessageInvoker } from 'serverless-queue';
+import type { QueueMessage } from 'serverless-queue';
+
+export class WorkerSelfInvoker<T> extends MessageInvoker<T> {
+  constructor(private env: { SELF: Fetcher; QUEUE_SECRET: string }) {
+    super();
+  }
+
+  async invoke(messages: QueueMessage<T>[]): Promise<void> {
+    const res = await this.env.SELF.fetch('https://self/api/queue', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${this.env.QUEUE_SECRET}`,
+      },
+      body: JSON.stringify(messages),
+    });
+
+    if (!res.ok) {
+      throw new Error(`Self-invoke failed: ${res.status}`);
+    }
+  }
+}
+```
+
+> 💡 **Tip:** `env.SELF` is a special binding in Cloudflare Workers that routes requests back to the same worker script without leaving Cloudflare's network. Enable it in `wrangler.toml` with `[unsafe.bindings] [[unsafe.bindings]] name = "SELF" type = "fetcher"` or use the `serviceWorkerDevtools` plugin.
+
+---
+
+## Note on bulk mode
+
+In `drainMode: 'bulk'`, `invoke` receives an **array of multiple messages**. The implementation doesn't change — the array is serialised as-is and the receiving handler passes the whole array to `queue.handle()`.
+
+```ts
+// drainMode: 'bulk' — invoke receives [msg1, msg2, msg3]
+body: JSON.stringify([msg1, msg2, msg3])
+
+// drainMode: 'individual' (default) — invoke receives [msg]
+body: JSON.stringify([msg])
+```
+
+Your handler always receives a JSON array, so it works for both modes without modification.
+
+---
+
+## Fire-and-forget guarantee
+
+The library calls `invoke` and catches any thrown error internally — the calling invocation never awaits the result or propagates the error. The `invoke` method itself must still throw on failure so the library can count retries.
+
+```
+selfInvoke([msg])
+    │
+    └── invoker.invoke([msg])
+            │
+          throws ──► orchestrator retries (up to invokeRetries)
+            │
+          resolves ──► next invocation starts
+            │
+    calling invocation continues
+    (does NOT wait for invoke to resolve)
+```
+
+This means your `invoke` implementation should be **fast to initiate** but doesn't need to wait for the receiving invocation to complete. The `fetch` call resolves as soon as the HTTP response (200) comes back — which is typically within a few hundred milliseconds.
+
+---
+
+## Testing with an in-process stub
+
+For unit tests, you can stub the invoker to capture what would have been self-invoked:
+
+```ts
+import { MessageInvoker } from 'serverless-queue';
+import type { QueueMessage } from 'serverless-queue';
+
+export class StubInvoker<T> extends MessageInvoker<T> {
+  public invocations: QueueMessage<T>[][] = [];
+  public shouldFail = false;
+
+  async invoke(messages: QueueMessage<T>[]): Promise<void> {
+    if (this.shouldFail) throw new Error('Simulated invoke failure');
+    this.invocations.push(messages);
+  }
+
+  reset(): void {
+    this.invocations = [];
+    this.shouldFail = false;
+  }
+}
+```

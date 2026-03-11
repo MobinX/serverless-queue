@@ -1,0 +1,400 @@
+---
+title: Cloudflare Workers
+description: Full production example for serverless-queue on Cloudflare Workers with D1 storage and SELF binding.
+---
+
+# Cloudflare Workers
+
+Cloudflare Workers is an excellent fit for `serverless-queue`: the V8 isolate model starts fast, D1 provides a SQLite-backed relational store, and `env.SELF.fetch` lets you self-invoke without knowing any external URL.
+
+---
+
+## Project structure
+
+```
+src/
+  queue/
+    storage.ts     ← D1Storage
+    action.ts      ← your business logic
+    invoker.ts     ← WorkerSelfInvoker
+    strategy.ts    ← retry strategy
+    index.ts       ← queue factory
+  index.ts         ← fetch handler entrypoint
+wrangler.toml
+migrations/
+  0001_create_queue_messages.sql
+```
+
+---
+
+## `wrangler.toml`
+
+```toml
+name = "my-worker"
+main = "src/index.ts"
+compatibility_date = "2024-09-01"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "queue-db"
+database_id = "your-d1-database-id"
+
+[vars]
+QUEUE_SECRET = "replace-with-a-real-secret"
+
+# SELF binding enables self-invocation without an external URL
+[[unsafe.bindings]]
+name = "SELF"
+type = "fetcher"
+service = "my-worker"
+```
+
+> 📝 **Note:** The `SELF` binding routes requests back to the same worker script without leaving Cloudflare's network. It's zero-latency and works identically in local development (`wrangler dev`) and production.
+
+---
+
+## D1 migration
+
+```sql
+-- migrations/0001_create_queue_messages.sql
+CREATE TABLE queue_messages (
+  id        TEXT    PRIMARY KEY,
+  queue_id  TEXT    NOT NULL,
+  message   TEXT    NOT NULL,
+  timestamp INTEGER NOT NULL,
+  state     TEXT    NOT NULL DEFAULT 'pending'
+);
+
+CREATE INDEX idx_queue_messages_queue_id_timestamp
+  ON queue_messages (queue_id, timestamp DESC);
+```
+
+Apply with:
+
+```bash
+wrangler d1 migrations apply queue-db
+```
+
+---
+
+## `src/queue/storage.ts`
+
+```ts
+import { MessageStorage } from 'serverless-queue';
+import type { StoredMessage, MessageState } from 'serverless-queue';
+
+export class D1Storage extends MessageStorage {
+  constructor(private db: D1Database) {
+    super();
+  }
+
+  async readMessage(id: string): Promise<StoredMessage | null> {
+    const row = await this.db
+      .prepare(
+        'SELECT id, queue_id AS queueId, message, timestamp, state FROM queue_messages WHERE id = ? LIMIT 1',
+      )
+      .bind(id)
+      .first<StoredMessage>();
+    return row ?? null;
+  }
+
+  async writeMessage(msg: StoredMessage): Promise<void> {
+    await this.db
+      .prepare(
+        'INSERT OR IGNORE INTO queue_messages (id, queue_id, message, timestamp, state) VALUES (?, ?, ?, ?, ?)',
+      )
+      .bind(msg.id, msg.queueId, msg.message, msg.timestamp, msg.state)
+      .run();
+  }
+
+  async updateMessage(msg: StoredMessage): Promise<void> {
+    if (msg.state === 'processing') {
+      const result = await this.db
+        .prepare(
+          "UPDATE queue_messages SET message = ?, state = ? WHERE id = ? AND state = 'pending'",
+        )
+        .bind(msg.message, msg.state, msg.id)
+        .run();
+
+      if (result.meta.changes === 0) {
+        throw new Error(`Race condition on message ${msg.id}: no longer pending`);
+      }
+    } else {
+      await this.db
+        .prepare('UPDATE queue_messages SET message = ?, state = ? WHERE id = ?')
+        .bind(msg.message, msg.state, msg.id)
+        .run();
+    }
+  }
+
+  async deleteMessage(id: string): Promise<void> {
+    await this.db
+      .prepare('DELETE FROM queue_messages WHERE id = ?')
+      .bind(id)
+      .run();
+  }
+
+  async readLastMessageByQueue(queueId: string): Promise<StoredMessage | null> {
+    const row = await this.db
+      .prepare(
+        'SELECT id, queue_id AS queueId, message, timestamp, state FROM queue_messages WHERE queue_id = ? ORDER BY timestamp DESC LIMIT 1',
+      )
+      .bind(queueId)
+      .first<StoredMessage>();
+    return row ?? null;
+  }
+
+  async readMessagesByQueue(
+    queueId: string,
+    state?: MessageState,
+    limit = 50,
+  ): Promise<StoredMessage[]> {
+    const stmt = state
+      ? this.db
+          .prepare(
+            'SELECT id, queue_id AS queueId, message, timestamp, state FROM queue_messages WHERE queue_id = ? AND state = ? ORDER BY timestamp ASC LIMIT ?',
+          )
+          .bind(queueId, state, limit)
+      : this.db
+          .prepare(
+            'SELECT id, queue_id AS queueId, message, timestamp, state FROM queue_messages WHERE queue_id = ? ORDER BY timestamp ASC LIMIT ?',
+          )
+          .bind(queueId, limit);
+
+    const { results } = await stmt.all<StoredMessage>();
+    return results;
+  }
+
+  async readPendingMessages(queueId: string, limit: number): Promise<StoredMessage[]> {
+    return this.readMessagesByQueue(queueId, 'pending', limit);
+  }
+}
+```
+
+---
+
+## `src/queue/action.ts`
+
+```ts
+import { MessageAction } from 'serverless-queue';
+import type { QueueMessage } from 'serverless-queue';
+
+export interface NotificationPayload {
+  userId: string;
+  type: 'welcome' | 'password_reset' | 'invoice';
+  data: Record<string, string>;
+}
+
+export class NotificationAction extends MessageAction<NotificationPayload> {
+  constructor(private emailServiceUrl: string, private apiKey: string) {
+    super();
+  }
+
+  async execute(messages: QueueMessage<NotificationPayload>[]): Promise<void> {
+    for (const msg of messages) {
+      const res = await fetch(this.emailServiceUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${this.apiKey}`,
+        },
+        body: JSON.stringify({
+          userId: msg.payload.userId,
+          type: msg.payload.type,
+          data: msg.payload.data,
+          messageId: msg.id,
+        }),
+      });
+
+      if (!res.ok) {
+        throw new Error(`Notification service error: ${res.status}`);
+      }
+    }
+  }
+}
+```
+
+---
+
+## `src/queue/invoker.ts`
+
+```ts
+import { MessageInvoker } from 'serverless-queue';
+import type { QueueMessage } from 'serverless-queue';
+import type { NotificationPayload } from './action';
+
+export class WorkerSelfInvoker extends MessageInvoker<NotificationPayload> {
+  constructor(
+    private self: Fetcher,
+    private secret: string,
+  ) {
+    super();
+  }
+
+  async invoke(messages: QueueMessage<NotificationPayload>[]): Promise<void> {
+    // Route to /api/queue on the same worker — no external URL needed
+    const res = await this.self.fetch('https://worker/api/queue', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${this.secret}`,
+      },
+      body: JSON.stringify(messages),
+    });
+
+    if (!res.ok) {
+      throw new Error(`Self-invoke failed: ${res.status}`);
+    }
+  }
+}
+```
+
+---
+
+## `src/queue/strategy.ts`
+
+```ts
+import { RetryStrategy } from 'serverless-queue';
+import type { QueueMessage } from 'serverless-queue';
+import type { NotificationPayload } from './action';
+
+export class NotificationRetryStrategy extends RetryStrategy<NotificationPayload> {
+  shouldRetry(_message: QueueMessage<NotificationPayload>, error: unknown): boolean {
+    if (error instanceof Error && error.message.includes('4')) return false; // 4xx = don't retry
+    return true;
+  }
+
+  async onExhausted(message: QueueMessage<NotificationPayload>): Promise<void> {
+    console.error('Message exhausted', { id: message.id, queueId: message.queueId });
+  }
+}
+```
+
+---
+
+## `src/queue/index.ts`
+
+```ts
+import { MessageQueue } from 'serverless-queue';
+import type { QueueConfig } from 'serverless-queue';
+import { D1Storage } from './storage';
+import { NotificationAction } from './action';
+import { WorkerSelfInvoker } from './invoker';
+import { NotificationRetryStrategy } from './strategy';
+import type { NotificationPayload } from './action';
+
+interface Env {
+  DB: D1Database;
+  SELF: Fetcher;
+  QUEUE_SECRET: string;
+  EMAIL_SERVICE_URL: string;
+  EMAIL_API_KEY: string;
+}
+
+const config: QueueConfig = {
+  batchSize: 5,
+  maxAttempts: 3,
+  invokeRetries: 3,
+  drainMode: 'individual',
+};
+
+export function createQueue(env: Env): MessageQueue<NotificationPayload> {
+  return new MessageQueue<NotificationPayload>(
+    new D1Storage(env.DB),
+    new NotificationAction(env.EMAIL_SERVICE_URL, env.EMAIL_API_KEY),
+    new NotificationRetryStrategy(),
+    new WorkerSelfInvoker(env.SELF, env.QUEUE_SECRET),
+    config,
+  );
+}
+```
+
+---
+
+## `src/index.ts` (fetch handler)
+
+```ts
+import { createQueue } from './queue';
+import type { QueueMessage } from 'serverless-queue';
+import type { NotificationPayload } from './queue/action';
+
+interface Env {
+  DB: D1Database;
+  SELF: Fetcher;
+  QUEUE_SECRET: string;
+  EMAIL_SERVICE_URL: string;
+  EMAIL_API_KEY: string;
+}
+
+export default {
+  async fetch(request: Request, env: Env): Promise<Response> {
+    const url = new URL(request.url);
+
+    if (url.pathname === '/api/queue' && request.method === 'POST') {
+      const auth = request.headers.get('authorization');
+      if (auth !== `Bearer ${env.QUEUE_SECRET}`) {
+        return new Response('Unauthorized', { status: 401 });
+      }
+
+      let messages: QueueMessage<NotificationPayload>[];
+      try {
+        messages = await request.json();
+      } catch {
+        return new Response('Invalid JSON', { status: 400 });
+      }
+
+      const queue = createQueue(env);
+      await queue.handle(messages);
+      return new Response(JSON.stringify({ ok: true }), {
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }
+
+    return new Response('Not Found', { status: 404 });
+  },
+};
+```
+
+---
+
+## Enqueueing from another worker or external source
+
+```ts
+// From another part of your worker
+async function enqueue(env: Env, userId: string, type: NotificationPayload['type'], data: Record<string, string>): Promise<void> {
+  const message: QueueMessage<NotificationPayload> = {
+    id: crypto.randomUUID(),
+    queueId: userId,
+    payload: { userId, type, data },
+    attempt: 0,
+    createdAt: Date.now(),
+    type: 'new',
+  };
+
+  // Use SELF to avoid an external HTTP round-trip
+  const res = await env.SELF.fetch('https://worker/api/queue', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${env.QUEUE_SECRET}`,
+    },
+    body: JSON.stringify([message]),
+  });
+
+  if (!res.ok) throw new Error(`Enqueue failed: ${res.status}`);
+}
+```
+
+---
+
+## Durable Objects vs `serverless-queue`
+
+| | `serverless-queue` | Durable Objects |
+|--|--|--|
+| **State** | Your D1 database | Built-in per-object storage |
+| **Serialisation** | Per `queueId` via DB lock | Per Durable Object instance |
+| **Complexity** | Low — just implement 4 abstract classes | Higher — custom WebSocket/alarm logic |
+| **Cost** | D1 reads/writes (very cheap) | DO requests + storage |
+| **Best for** | Queue workloads with an existing DB | Real-time collaboration, presence, gaming |
+
+Use `serverless-queue` when you need durable async queues and already have D1. Use Durable Objects when you need per-object strong consistency, WebSockets, or the alarm API.

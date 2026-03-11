@@ -1,0 +1,217 @@
+---
+title: Concepts
+description: Understand the message lifecycle, busy-lock mechanism, fire-and-forget self-invocation, and drain cycles.
+---
+
+# Concepts
+
+This page explains the core ideas behind `serverless-queue`. Understanding these concepts helps you reason about ordering, concurrency, and failure modes — which is essential when building on top of any queue system.
+
+---
+
+## The queueId partition key
+
+Every message belongs to a **queue**, identified by its `queueId`. This is a string you choose — a `userId`, `tenantId`, `orderId`, or any other meaningful partition key.
+
+```
+queueId: "user_abc"   ──► [msg1] ──► [msg2] ──► [msg3]  (serial)
+queueId: "user_def"   ──► [msg4] ──► [msg5]              (serial, independent)
+queueId: "user_ghi"   ──► [msg6]                          (serial, independent)
+```
+
+**Messages within the same `queueId` are always processed serially** — one at a time, in FIFO order. Messages across different `queueId` values are independent and run in parallel (each in their own invocation).
+
+This design is useful for:
+
+- **Per-user queues** — ensure a user's events are processed in order
+- **Per-tenant queues** — isolate tenants from each other's load spikes
+- **Per-order queues** — prevent concurrent mutations on the same order
+- **Per-resource queues** — serialise writes to a specific record
+
+> 💡 **Tip:** If you don't need serialisation and just want best-effort parallel processing, use a unique `queueId` per message (e.g. the message's own UUID). Each message will then have its own independent queue.
+
+---
+
+## Message lifecycle states
+
+Every message moves through a sequence of states stored in your database:
+
+```
+                   ┌─────────┐
+   new message ──► │ pending │
+                   └────┬────┘
+                        │  promote
+                        ▼
+                   ┌────────────┐
+                   │ processing │
+                   └─────┬──────┘
+                         │
+              ┌──────────┴──────────┐
+              │                     │
+           success               failure
+              │                     │
+              ▼                     ▼
+          ┌──────┐          shouldRetry?
+          │ done │               │
+          └──────┘         ┌─────┴─────┐
+                           YES         NO
+                           │           │
+                      increment    onExhausted()
+                      attempt           │
+                      selfInvoke        ▼
+                      (retry)      ┌────────┐
+                                   │ failed │
+                                   └────────┘
+```
+
+| State | Meaning |
+|-------|---------|
+| `pending` | Written but not yet being executed. Waiting for the queue to become free, or queued behind a `processing` message. |
+| `processing` | Currently being executed by an active invocation. |
+| `done` | Successfully executed. Terminal state. |
+| `failed` | Exhausted all retry attempts. Terminal state. Triggers `onExhausted`. |
+
+---
+
+## The busy-lock mechanism
+
+`serverless-queue` does **not** use an external lock, mutex, or distributed semaphore. Instead, it uses the database itself as the lock.
+
+The rule is simple: **a queue is busy if its most-recent row has state `pending` or `processing`.**
+
+```
+readLastMessageByQueue(queueId)
+         │
+    ┌────┴────┐
+    │  state  │
+    └────┬────┘
+         │
+    ┌────┴──────────────────────────┐
+    │                               │
+  'pending' or 'processing'     'done' / 'failed' / null
+         │                               │
+    queue is BUSY                   queue is IDLE
+    write as 'pending'              write as 'pending'
+    return 200                      promote to 'processing'
+                                    execute
+```
+
+When a new message arrives:
+
+1. Read the last message for the `queueId`
+2. If the last message is `pending` or `processing` → write the new message as `pending` and return immediately
+3. If the last message is `done`, `failed`, or doesn't exist → write as `pending`, immediately promote to `processing`, and execute
+
+This means concurrent invocations are safe: if two messages for the same `queueId` arrive simultaneously, one will see the other's `processing` row and defer.
+
+> ⚠️ **Warning:** The read-then-write busy check is two sequential operations. In high-concurrency scenarios, two invocations can observe the same "idle" state and both proceed to execute. To guard against this, your `updateMessage` implementation should use **conditional writes** (a DB transaction, `ConditionExpression`, or `SELECT FOR UPDATE`). See the [Storage guide](/storage) for examples.
+
+---
+
+## Fire-and-forget self-invocation
+
+The self-invocation pattern is what makes the queue durable without a broker. After successfully processing a message (or exhausting retries), the orchestrator fires an HTTP POST back to its own endpoint to process the next pending message.
+
+```
+process(msg) succeeds
+      │
+      ▼
+mark 'done'
+      │
+      ▼
+drainPending(queueId)
+      │
+      ▼
+pending messages?
+      │
+     YES
+      │
+      ▼
+invoker.invoke([next_msg])   ← fire-and-forget
+      │                           │
+   returns                     (async, no await)
+   immediately
+```
+
+**Fire-and-forget** means the current invocation does not wait for the self-invoke HTTP call to complete. It fires the request and returns 200. The next invocation picks up independently.
+
+If the HTTP call fails, the library retries it up to `invokeRetries` times (default: 3), each attempt also fire-and-forget. If all invoke retries are exhausted, the pending messages remain in the database and can be picked up by a [recovery cron job](/recipes/recovery-cron).
+
+---
+
+## Why `handle()` always returns 200
+
+Serverless platforms (Vercel, Lambda, Cloud Run) have their own retry mechanisms triggered by non-2xx responses. If your function throws or returns 500, the platform will re-deliver the same message — which could cause double-processing.
+
+`MessageQueue.handle()` **never throws and always resolves**. This means:
+
+- Your serverless handler always returns HTTP 200
+- Platform-level retries never kick in
+- All retry logic is owned by the library, not the platform
+- Storage failures are swallowed at the top level (the function still returns 200)
+
+```ts
+// This is safe to do:
+export async function POST(req: Request) {
+  const messages = await req.json();
+  await queue.handle(messages);          // never throws
+  return new Response('ok', { status: 200 }); // always 200
+}
+```
+
+---
+
+## Drain cycles
+
+After a message completes (success or terminal failure), the orchestrator checks for pending messages in the same queue and fires self-invocations to drain them.
+
+### `drainMode: 'individual'` (default)
+
+One HTTP self-invocation per pending message, up to `batchSize`:
+
+```
+drainPending('user_abc')
+      │
+      ├── pending: [msg2, msg3, msg4]   (batchSize: 3)
+      │
+      ├── selfInvoke([msg2])  ──► POST /api/queue  ─► process msg2
+      ├── selfInvoke([msg3])  ──► POST /api/queue  ─► process msg3
+      └── selfInvoke([msg4])  ──► POST /api/queue  ─► process msg4
+```
+
+All three invocations fire in parallel (fire-and-forget). Each processes one message independently.
+
+> ⚠️ **Warning:** With `drainMode: 'individual'`, multiple invocations start simultaneously for the same `queueId`. The busy-lock prevents double-execution: the first to promote its message to `processing` wins; the others will see the busy state and defer their message back to `pending` on their next cycle. This is correct but relies on your `updateMessage` being atomic.
+
+### `drainMode: 'bulk'`
+
+A single HTTP self-invocation carrying all pending messages:
+
+```
+drainPending('user_abc')
+      │
+      ├── pending: [msg2, msg3, msg4]   (batchSize: 3)
+      │
+      └── selfInvoke([msg2, msg3, msg4])  ──► POST /api/queue  ─► process all
+```
+
+The action's `execute()` receives all three messages in one call. Useful for batching DB writes or API calls. See [Drain Modes](/recipes/drain-modes) for a comparison.
+
+---
+
+## Atomic writes requirement
+
+The `pending → processing` state transition is critical. The orchestrator reads the last message, decides the queue is idle, then writes a `processing` state. If two concurrent invocations both read "idle" before either has written "processing", both will proceed and execute the same message twice.
+
+To prevent this, `updateMessage` should be wrapped in a transaction or use a conditional write:
+
+```sql
+-- PostgreSQL: conditional update (only succeeds if state is still 'pending')
+UPDATE queue_messages
+SET state = 'processing'
+WHERE id = $1 AND state = 'pending'
+RETURNING id;
+-- If 0 rows returned: another invocation got there first, abort.
+```
+
+See the [Storage guide](/storage) for full examples with Postgres, Redis, and D1.

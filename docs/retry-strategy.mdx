@@ -1,0 +1,244 @@
+---
+title: Retry Strategy
+description: Implement RetryStrategy to control retry behaviour and handle exhausted messages.
+---
+
+# Retry Strategy
+
+`RetryStrategy<T>` gives you full control over when to retry a failed message and what to do when retries run out. It's the bridge between your action's error types and the queue's retry machinery.
+
+---
+
+## Interface
+
+```ts
+import { RetryStrategy } from 'serverless-queue';
+import type { QueueMessage } from 'serverless-queue';
+
+export abstract class RetryStrategy<T = unknown> {
+  abstract shouldRetry(message: QueueMessage<T>, error: unknown): boolean;
+  abstract onExhausted(message: QueueMessage<T>): Promise<void>;
+}
+```
+
+### `shouldRetry(message, error)`
+
+Called after every failure, **before** checking if `attempt >= maxAttempts`. Return:
+
+- `true` → retry (if attempts remain)
+- `false` → skip remaining attempts and call `onExhausted` immediately
+
+The `message` argument has the current `attempt` count (not yet incremented). Use it to implement back-off hints or attempt-conditional logic.
+
+### `onExhausted(message)`
+
+Called when the message cannot be retried — either because `shouldRetry` returned `false` or because `attempt >= maxAttempts - 1` on the last attempt. After this resolves, the orchestrator marks the message `'failed'` and drains the pending queue.
+
+**If `onExhausted` itself throws**, the error is swallowed and the message is still marked `'failed'`. The queue continues.
+
+---
+
+## Minimal implementation
+
+```ts
+import { RetryStrategy } from 'serverless-queue';
+import type { QueueMessage } from 'serverless-queue';
+
+export class AlwaysRetryStrategy extends RetryStrategy<unknown> {
+  shouldRetry(_message: QueueMessage<unknown>, _error: unknown): boolean {
+    return true; // retry everything until maxAttempts is reached
+  }
+
+  async onExhausted(message: QueueMessage<unknown>): Promise<void> {
+    console.error('[queue] message exhausted', { id: message.id, queueId: message.queueId });
+  }
+}
+```
+
+---
+
+## Production-grade implementation
+
+```ts
+import { RetryStrategy } from 'serverless-queue';
+import type { QueueMessage } from 'serverless-queue';
+
+// Custom error types your action might throw
+class ValidationError extends Error {
+  name = 'ValidationError';
+}
+
+class RateLimitError extends Error {
+  name = 'RateLimitError';
+  constructor(public retryAfterMs: number) {
+    super('Rate limited');
+  }
+}
+
+interface MyPayload {
+  userId: string;
+  action: string;
+}
+
+export class SmartRetryStrategy extends RetryStrategy<MyPayload> {
+  shouldRetry(message: QueueMessage<MyPayload>, error: unknown): boolean {
+    // Never retry validation errors — the payload is broken, retrying won't help
+    if (error instanceof ValidationError) {
+      console.warn('[queue] validation error, not retrying', {
+        id: message.id,
+        error: error.message,
+      });
+      return false;
+    }
+
+    // Always retry network/transient errors
+    if (error instanceof TypeError && error.message.includes('fetch')) {
+      return true;
+    }
+
+    // Always retry rate limit errors (the delay comes from invokeRetries + cold starts)
+    if (error instanceof RateLimitError) {
+      return true;
+    }
+
+    // Retry unknown errors — better to over-retry than to silently drop messages
+    return true;
+  }
+
+  async onExhausted(message: QueueMessage<MyPayload>): Promise<void> {
+    console.error('[queue] message exhausted after all retries', {
+      id: message.id,
+      queueId: message.queueId,
+      attempt: message.attempt,
+      payload: message.payload,
+    });
+
+    // Push to dead-letter table
+    await db.deadLetterMessages.create({
+      data: {
+        originalId: message.id,
+        queueId: message.queueId,
+        payload: JSON.stringify(message.payload),
+        finalAttempt: message.attempt,
+        failedAt: new Date(),
+      },
+    });
+
+    // Alert engineering
+    await fetch(process.env.SLACK_WEBHOOK_URL!, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        text: `⚠️ Queue message exhausted: \`${message.id}\` (queue: \`${message.queueId}\`, attempts: ${message.attempt + 1})`,
+      }),
+    });
+  }
+}
+```
+
+---
+
+## Error-type filtering examples
+
+### Never retry validation errors
+
+```ts
+shouldRetry(_message: QueueMessage<T>, error: unknown): boolean {
+  if (error instanceof SyntaxError) return false;
+  if (error instanceof TypeError && error.message.includes('Invalid')) return false;
+  return true;
+}
+```
+
+### Only retry network errors
+
+```ts
+shouldRetry(_message: QueueMessage<T>, error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  const networkErrors = ['ECONNREFUSED', 'ECONNRESET', 'ETIMEDOUT', 'fetch failed'];
+  return networkErrors.some(pattern => error.message.includes(pattern));
+}
+```
+
+### Retry based on HTTP status code
+
+```ts
+class HttpError extends Error {
+  constructor(public status: number, message: string) {
+    super(message);
+  }
+}
+
+shouldRetry(_message: QueueMessage<T>, error: unknown): boolean {
+  if (error instanceof HttpError) {
+    // Retry server errors (5xx) but not client errors (4xx)
+    return error.status >= 500;
+  }
+  return true;
+}
+```
+
+---
+
+## Attempt-aware retry hints
+
+The `message.attempt` counter is available in `shouldRetry`. While actual back-off delay isn't directly controllable (retries fire as fast as the self-invoke round-trip), you can use `attempt` to implement circuit-breaker-style limits:
+
+```ts
+shouldRetry(message: QueueMessage<T>, _error: unknown): boolean {
+  // Progressively widen the error tolerance on later attempts
+  // Early attempts: only retry transient errors
+  // Later attempts: retry everything (message must be important if we've tried this many times)
+  if (message.attempt < 2) {
+    return error instanceof NetworkError;
+  }
+  return true;
+}
+```
+
+> 📝 **Note:** If you need true exponential back-off with delays (e.g. retry in 1s, 2s, 4s), you cannot block inside `shouldRetry` — that would hold the serverless invocation open. Instead, implement a [recovery cron job](/recipes/recovery-cron) that scans for messages in `processing` state older than a configurable threshold and re-enqueues them.
+
+---
+
+## `onExhausted` patterns
+
+### Log to observability platform
+
+```ts
+async onExhausted(message: QueueMessage<T>): Promise<void> {
+  await fetch('https://api.axiom.co/v1/datasets/queue-dlq/ingest', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${process.env.AXIOM_API_KEY}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify([{
+      _time: new Date().toISOString(),
+      id: message.id,
+      queueId: message.queueId,
+      attempt: message.attempt,
+      payload: message.payload,
+    }]),
+  });
+}
+```
+
+### Push to a secondary DLQ endpoint
+
+```ts
+async onExhausted(message: QueueMessage<T>): Promise<void> {
+  await fetch(`${process.env.DLQ_URL}/api/dead-letter`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${process.env.QUEUE_SECRET}`,
+    },
+    body: JSON.stringify({
+      originalMessage: message,
+      exhaustedAt: Date.now(),
+    }),
+  });
+}
+```
+
+See the [Dead-Letter Queue recipe](/recipes/dead-letter-queue) for a full end-to-end DLQ implementation.

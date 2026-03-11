@@ -1,0 +1,164 @@
+---
+title: Configuration
+description: All QueueConfig fields explained with types, defaults, and tuning guidance.
+---
+
+# Configuration
+
+`MessageQueue` is configured via a `QueueConfig` object passed at construction time. All settings are static — they apply for the lifetime of the queue instance.
+
+```ts
+import { MessageQueue } from 'serverless-queue';
+import type { QueueConfig } from 'serverless-queue';
+
+const config: QueueConfig = {
+  batchSize: 5,
+  maxAttempts: 3,
+  invokeRetries: 3,
+  drainMode: 'individual',
+};
+
+const queue = new MessageQueue(storage, action, strategy, invoker, config);
+```
+
+---
+
+## `batchSize`
+
+**Type:** `number` · **Required** · No default
+
+The maximum number of `pending` messages to fetch and dispatch as self-invocations in a single drain cycle.
+
+```ts
+const config: QueueConfig = {
+  batchSize: 10,   // drain up to 10 pending messages after each completed job
+  maxAttempts: 3,
+};
+```
+
+### Tuning guidance
+
+| Concern | Recommendation |
+|---------|---------------|
+| HTTP payload size limit | Keep `batchSize` small (≤ 10) when using `drainMode: 'bulk'` — all messages are serialised into one request body |
+| Platform concurrency limit | Keep `batchSize` ≤ your platform's max concurrent function invocations (e.g. Vercel hobby: 10) |
+| Throughput | Larger `batchSize` drains the queue faster but may overwhelm downstream services |
+| Safety | Set `batchSize: 1` for a strictly serial queue where only one message is in-flight at any time |
+
+> 💡 **Tip:** For most use cases, `batchSize: 5` is a safe starting point. Increase it only after measuring your actual throughput and concurrency limits.
+
+> 📝 **Note:** In `drainMode: 'individual'`, `batchSize` controls how many parallel self-invocations are fired per drain cycle, each carrying one message. In `drainMode: 'bulk'`, it controls how many messages are bundled into a single invocation.
+
+---
+
+## `maxAttempts`
+
+**Type:** `number` · **Required** · No default
+
+The total number of attempts (including the first) before a message is handed to `RetryStrategy.onExhausted` and marked `'failed'`.
+
+```ts
+const config: QueueConfig = {
+  batchSize: 5,
+  maxAttempts: 5,   // 1 initial attempt + 4 retries
+};
+```
+
+### Behaviour
+
+- On attempt `0`: first execution
+- On failure (and `shouldRetry` returns `true`): `attempt` increments to `1`, self-invoke fires
+- On attempt `maxAttempts - 1`: if this attempt also fails, `onExhausted` is called and the message is marked `'failed'`
+- If `shouldRetry` returns `false` at any point, `onExhausted` is called immediately regardless of remaining attempts
+
+```
+maxAttempts: 3
+  attempt 0 ──► fail ──► shouldRetry? YES ──► attempt 1
+  attempt 1 ──► fail ──► shouldRetry? YES ──► attempt 2
+  attempt 2 ──► fail ──► (maxAttempts reached) ──► onExhausted ──► 'failed'
+```
+
+> ⚠️ **Warning:** `maxAttempts` counts total attempts, not retries. `maxAttempts: 1` means no retries — a single failure immediately triggers `onExhausted`.
+
+---
+
+## `invokeRetries`
+
+**Type:** `number` · **Optional** · **Default:** `3`
+
+How many times the orchestrator retries a failed **self-invocation** (i.e. when `MessageInvoker.invoke()` throws a network or HTTP error) before giving up.
+
+```ts
+const config: QueueConfig = {
+  batchSize: 5,
+  maxAttempts: 3,
+  invokeRetries: 5,   // try to self-invoke up to 5 times before giving up
+};
+```
+
+### `maxAttempts` vs `invokeRetries` — what's the difference?
+
+| Setting | Governs | Triggered by |
+|---------|---------|-------------|
+| `maxAttempts` | How many times your **action** is executed | `MessageAction.execute()` throwing |
+| `invokeRetries` | How many times the **HTTP self-invoke** is retried | `MessageInvoker.invoke()` throwing |
+
+Think of it this way:
+
+- `maxAttempts` is about your **business logic** failing (bad email address, API 500, etc.)
+- `invokeRetries` is about the **transport** failing (network blip, function cold start timeout, etc.)
+
+```
+maxAttempts: 3 (your action is tried 3 times)
+invokeRetries: 3 (each self-invoke HTTP call is retried 3 times)
+
+Worst case per retry cycle:
+  ┌─ invokeRetries attempts to fire HTTP POST to self
+  │    └─ if all fail: message stays 'pending', recovery cron picks it up
+  └─ if HTTP succeeds: new invocation runs, action is tried (maxAttempts applies)
+```
+
+If all `invokeRetries` are exhausted, the message remains in its current state in the database. A [recovery cron job](/recipes/recovery-cron) can detect these stuck messages and re-invoke them.
+
+---
+
+## `drainMode`
+
+**Type:** `'individual' | 'bulk'` · **Optional** · **Default:** `'individual'`
+
+Controls how pending messages are dispatched after a message completes.
+
+```ts
+const config: QueueConfig = {
+  batchSize: 5,
+  maxAttempts: 3,
+  drainMode: 'bulk',   // send all pending messages in one HTTP call
+};
+```
+
+### Comparison
+
+| | `'individual'` (default) | `'bulk'` |
+|---|---|---|
+| **HTTP calls per drain** | One per pending message (up to `batchSize`) | One for all pending messages |
+| **Parallelism** | High — all invocations start simultaneously | None — one invocation processes all |
+| **Partial failure** | Other messages are unaffected if one fails | All messages in the batch fail together |
+| **`execute()` receives** | Array of 1 message | Array of N messages |
+| **Payload size** | Small (1 message per request) | Larger (all messages in one request) |
+| **Best for** | Independent messages, high throughput | Batched DB writes, API calls that support bulk operations |
+
+### When to use `'individual'`
+
+- Messages are independent (failure of one shouldn't affect others)
+- You want maximum parallelism across a queue's pending messages
+- Your action processes one item at a time
+
+### When to use `'bulk'`
+
+- Your action supports batch operations (e.g. bulk insert, batch email send)
+- You want to reduce HTTP call overhead
+- Messages within a batch can share a transaction or API call
+
+> 📝 **Note:** Even in `bulk` mode, the serialisation guarantee (one active `processing` row per `queueId`) still holds. The entire batch moves through the lifecycle as a unit.
+
+See [Drain Modes recipe](/recipes/drain-modes) for code examples of both configurations.
