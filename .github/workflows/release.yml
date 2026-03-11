@@ -52,4 +52,4 @@ jobs:
         run: npx semantic-release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          NPM_CONFIG_PROVENANCE: "true"   # tells npm CLI to use OIDC — no NPM_TOKEN needed
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
