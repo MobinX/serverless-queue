@@ -399,4 +399,4 @@ curl -X POST http://localhost:3000/api/jobs \
 sqlite3 queue.db "SELECT id, queue_id, state FROM queue_messages ORDER BY timestamp DESC LIMIT 10;"
 ```
 
-> 💡 **Tip:** SQLite is great for development and low-traffic production use. For higher throughput, swap `SQLiteStorage` for the [Postgres implementation](/storage#postgres-vercelpostgres) without changing any other code.
+> 💡 **Tip:** SQLite is great for development and low-traffic production use. For higher throughput, swap `SQLiteStorage` for the [Postgres implementation](../storage.mdx#postgres-vercelpostgres) without changing any other code.

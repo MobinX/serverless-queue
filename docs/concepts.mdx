@@ -104,7 +104,7 @@ When a new message arrives:
 
 This means concurrent invocations are safe: if two messages for the same `queueId` arrive simultaneously, one will see the other's `processing` row and defer.
 
-> ⚠️ **Warning:** The read-then-write busy check is two sequential operations. In high-concurrency scenarios, two invocations can observe the same "idle" state and both proceed to execute. To guard against this, your `updateMessage` implementation should use **conditional writes** (a DB transaction, `ConditionExpression`, or `SELECT FOR UPDATE`). See the [Storage guide](/storage) for examples.
+> ⚠️ **Warning:** The read-then-write busy check is two sequential operations. In high-concurrency scenarios, two invocations can observe the same "idle" state and both proceed to execute. To guard against this, your `updateMessage` implementation should use **conditional writes** (a DB transaction, `ConditionExpression`, or `SELECT FOR UPDATE`). See the [Storage guide](./storage.mdx) for examples.
 
 ---
 
@@ -135,7 +135,7 @@ invoker.invoke([next_msg])   ← fire-and-forget
 
 **Fire-and-forget** means the current invocation does not wait for the self-invoke HTTP call to complete. It fires the request and returns 200. The next invocation picks up independently.
 
-If the HTTP call fails, the library retries it up to `invokeRetries` times (default: 3), each attempt also fire-and-forget. If all invoke retries are exhausted, the pending messages remain in the database and can be picked up by a [recovery cron job](/recipes/recovery-cron).
+If the HTTP call fails, the library retries it up to `invokeRetries` times (default: 3), each attempt also fire-and-forget. If all invoke retries are exhausted, the pending messages remain in the database and can be picked up by a [recovery cron job](./recipes/recovery-cron.mdx).
 
 ---
 
@@ -195,7 +195,7 @@ drainPending('user_abc')
       └── selfInvoke([msg2, msg3, msg4])  ──► POST /api/queue  ─► process all
 ```
 
-The action's `execute()` receives all three messages in one call. Useful for batching DB writes or API calls. See [Drain Modes](/recipes/drain-modes) for a comparison.
+The action's `execute()` receives all three messages in one call. Useful for batching DB writes or API calls. See [Drain Modes](./recipes/drain-modes.mdx) for a comparison.
 
 ---
 
@@ -214,4 +214,4 @@ RETURNING id;
 -- If 0 rows returned: another invocation got there first, abort.
 ```
 
-See the [Storage guide](/storage) for full examples with Postgres, Redis, and D1.
+See the [Storage guide](./storage.mdx) for full examples with Postgres, Redis, and D1.

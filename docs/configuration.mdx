@@ -118,7 +118,7 @@ Worst case per retry cycle:
   └─ if HTTP succeeds: new invocation runs, action is tried (maxAttempts applies)
 ```
 
-If all `invokeRetries` are exhausted, the message remains in its current state in the database. A [recovery cron job](/recipes/recovery-cron) can detect these stuck messages and re-invoke them.
+If all `invokeRetries` are exhausted, the message remains in its current state in the database. A [recovery cron job](./recipes/recovery-cron.mdx) can detect these stuck messages and re-invoke them.
 
 ---
 
@@ -161,4 +161,4 @@ const config: QueueConfig = {
 
 > 📝 **Note:** Even in `bulk` mode, the serialisation guarantee (one active `processing` row per `queueId`) still holds. The entire batch moves through the lifecycle as a unit.
 
-See [Drain Modes recipe](/recipes/drain-modes) for code examples of both configurations.
+See [Drain Modes recipe](./recipes/drain-modes.mdx) for code examples of both configurations.

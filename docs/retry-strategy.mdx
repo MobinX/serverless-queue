@@ -196,7 +196,7 @@ shouldRetry(message: QueueMessage<T>, _error: unknown): boolean {
 }
 ```
 
-> 📝 **Note:** If you need true exponential back-off with delays (e.g. retry in 1s, 2s, 4s), you cannot block inside `shouldRetry` — that would hold the serverless invocation open. Instead, implement a [recovery cron job](/recipes/recovery-cron) that scans for messages in `processing` state older than a configurable threshold and re-enqueues them.
+> 📝 **Note:** If you need true exponential back-off with delays (e.g. retry in 1s, 2s, 4s), you cannot block inside `shouldRetry` — that would hold the serverless invocation open. Instead, implement a [recovery cron job](./recipes/recovery-cron.mdx) that scans for messages in `processing` state older than a configurable threshold and re-enqueues them.
 
 ---
 
@@ -241,4 +241,4 @@ async onExhausted(message: QueueMessage<T>): Promise<void> {
 }
 ```
 
-See the [Dead-Letter Queue recipe](/recipes/dead-letter-queue) for a full end-to-end DLQ implementation.
+See the [Dead-Letter Queue recipe](./recipes/dead-letter-queue.mdx) for a full end-to-end DLQ implementation.
