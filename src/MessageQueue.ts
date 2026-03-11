@@ -173,34 +173,19 @@ export class MessageQueue<T = unknown> {
 
   /**
    * Fire-and-forget self-invocation via the injected `MessageInvoker`.
-   * Internally retries up to `invokeRetries` times before giving up.
-   * If all retries are exhausted the message remains in its current state
-   * so an external recovery job (e.g. cron) can pick it up.
+   * On failure, immediately fires a new invoke attempt and returns — the
+   * current instance is never blocked waiting for retries.
+   * Once `invokeRetries` attempts are exhausted the message remains in its
+   * current state so an external recovery job (e.g. cron) can pick it up.
    */
-  private selfInvoke(message: QueueMessage<T>): void {
-    this.invokeWithRetry(message).catch(() => {
-      // All invoke retries exhausted — message stays in current state for recovery.
-    });
-  }
-
-  /**
-   * Attempt `invoke` up to `invokeRetries + 1` times, re-throwing the last
-   * error if every attempt fails so the caller can decide what to do.
-   */
-  private async invokeWithRetry(message: QueueMessage<T>): Promise<void> {
-    const maxRetries = this.config.invokeRetries ?? 3;
-    let lastError: unknown;
-
-    for (let attempt = 0; attempt <= maxRetries; attempt++) {
-      try {
-        await this.invoker.invoke(message);
-        return;
-      } catch (error) {
-        lastError = error;
+  private selfInvoke(message: QueueMessage<T>, invokeAttempt = 0): void {
+    this.invoker.invoke(message).catch(() => {
+      const maxRetries = this.config.invokeRetries ?? 3;
+      if (invokeAttempt < maxRetries) {
+        this.selfInvoke(message, invokeAttempt + 1);
       }
-    }
-
-    throw lastError;
+      // Retries exhausted — message stays in current state for recovery.
+    });
   }
 
   /**
