@@ -65,6 +65,8 @@ The function returns HTTP 200 in every case — so the platform never retries on
 - **Zero infrastructure** — no message broker, no extra services; works with any database you already have
 - **Durable by default** — messages are persisted before any processing begins; nothing is lost on crash
 - **Per-queue serialisation** — partition by `queueId` (userId, tenantId, orderId); queues are independent
+- **`DrizzleStorage` built-in** — `DrizzlePgStorage` and `DrizzleSqliteStorage` ship ready to use; no storage code needed
+- **`SimpleRetryStrategy` built-in** — configure retry behaviour with a predicate and `onExhausted` callback
 - **Configurable retries** — plug in any retry strategy: exponential back-off, error-type filtering, circuit breakers
 - **Dead-letter support** — `onExhausted` hook fires when retries run out; push to DLQ, send alerts, log to observability platforms
 - **Drain modes** — `individual` (default, parallel per-message) or `bulk` (single HTTP call for a batch)
@@ -119,6 +121,7 @@ bun add serverless-queue
 ## Next steps
 
 - [Getting Started](./getting-started.mdx) — wire up a queue in 5 minutes
+- [Drizzle Storage](./drizzle-storage.mdx) — ready-made storage for Postgres and SQLite via Drizzle ORM
 - [Concepts](./concepts.mdx) — understand the message lifecycle and busy-lock mechanism
 - [Configuration](./configuration.mdx) — tune `batchSize`, `maxAttempts`, `drainMode`
 - [Storage](./storage.mdx) — implement `MessageStorage` for Postgres, Redis, D1, SQLite

@@ -9,6 +9,24 @@ description: Implement MessageStorage for your database — Postgres, Redis, Clo
 
 ---
 
+## Pre-built: DrizzleStorage (recommended)
+
+The fastest way to get started. No need to write storage code.
+
+```ts
+import { DrizzlePgStorage, pgQueueMessages } from 'serverless-queue'
+```
+
+`DrizzlePgStorage` and `DrizzleSqliteStorage` work with any Drizzle ORM database instance — Neon, Vercel Postgres, Supabase, Cloudflare D1, Turso, Bun SQLite, better-sqlite3, and more.
+
+See the **[Drizzle Storage guide](./drizzle-storage.mdx)** for full documentation, all supported adapters, migration options, and Drizzle Kit integration.
+
+---
+
+## Manual implementations
+
+---
+
 ## Interface
 
 ```ts

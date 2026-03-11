@@ -1,0 +1,58 @@
+name: Release
+
+# Runs on every push to main.
+# semantic-release decides whether a release is needed based on conventional commits:
+#   feat: ...            → minor bump  (0.x.0)
+#   fix: / perf: ...     → patch bump  (0.0.x)
+#   BREAKING CHANGE: ... → major bump  (x.0.0)
+#   chore: / docs: ...   → no release
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  release:
+    name: Test › Build › Release
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write        # create GitHub releases, push CHANGELOG/package.json
+      issues: write          # comment on issues when they're resolved in a release
+      pull-requests: write   # comment on PRs when they're included in a release
+      id-token: write        # npm provenance attestation (OIDC)
+
+    steps:
+      - name: Checkout (full history required by semantic-release)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          # Use a PAT so the version-bump commit triggers CI on the next branch push.
+          # If you don't have a PAT, use GITHUB_TOKEN — the bump commit just won't re-trigger CI.
+          token: ${{ secrets.GH_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Run tests
+        run: bun test
+
+      - name: Build
+        run: bun run build
+
+      - name: Setup Node.js (required for npm publish)
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Release
+        run: npx semantic-release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}

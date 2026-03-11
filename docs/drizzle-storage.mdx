@@ -1,0 +1,220 @@
+---
+title: Drizzle Storage
+description: Zero-config storage implementations for Drizzle ORM — supports Postgres (Neon, Vercel, Supabase, Railway) and SQLite (Cloudflare D1, Turso, Bun SQLite, better-sqlite3).
+---
+
+# Drizzle Storage
+
+`serverless-queue` ships two ready-to-use storage implementations for [Drizzle ORM](https://orm.drizzle.team/):
+
+- **`DrizzlePgStorage`** — for any Postgres-based Drizzle database
+- **`DrizzleSqliteStorage`** — for any SQLite-based Drizzle database
+
+No custom storage code required. Pass your Drizzle `db` instance and you're done.
+
+---
+
+## Install
+
+```bash
+npm install serverless-queue drizzle-orm
+# or
+bun add serverless-queue drizzle-orm
+```
+
+---
+
+## Import
+
+```ts
+import {
+  DrizzlePgStorage,
+  DrizzleSqliteStorage,
+  pgQueueMessages,
+  sqliteQueueMessages,
+  MIGRATION_SQL,
+} from 'serverless-queue'
+```
+
+---
+
+## Postgres
+
+`DrizzlePgStorage` works with any Drizzle Postgres adapter.
+
+### Neon (serverless)
+
+```ts
+import { neon } from '@neondatabase/serverless'
+import { drizzle } from 'drizzle-orm/neon-http'
+import { DrizzlePgStorage, pgQueueMessages } from 'serverless-queue'
+
+const db = drizzle(neon(process.env.DATABASE_URL!))
+const storage = new DrizzlePgStorage(db)
+// or with an explicit table reference:
+const storage = new DrizzlePgStorage(db, pgQueueMessages)
+```
+
+### Vercel Postgres
+
+```ts
+import { sql } from '@vercel/postgres'
+import { drizzle } from 'drizzle-orm/vercel-postgres'
+import { DrizzlePgStorage } from 'serverless-queue'
+
+const db = drizzle(sql)
+const storage = new DrizzlePgStorage(db)
+```
+
+### Supabase / Railway / plain pg
+
+```ts
+import { Pool } from 'pg'
+import { drizzle } from 'drizzle-orm/node-postgres'
+import { DrizzlePgStorage } from 'serverless-queue'
+
+const pool = new Pool({ connectionString: process.env.DATABASE_URL })
+const db = drizzle(pool)
+const storage = new DrizzlePgStorage(db)
+```
+
+---
+
+## SQLite
+
+`DrizzleSqliteStorage` works with any Drizzle SQLite adapter.
+
+### Cloudflare D1
+
+```ts
+import { drizzle } from 'drizzle-orm/d1'
+import { DrizzleSqliteStorage } from 'serverless-queue'
+
+// In your Cloudflare Worker handler:
+const storage = new DrizzleSqliteStorage(drizzle(env.DB))
+```
+
+### Turso / libsql
+
+```ts
+import { createClient } from '@libsql/client'
+import { drizzle } from 'drizzle-orm/libsql'
+import { DrizzleSqliteStorage } from 'serverless-queue'
+
+const client = createClient({ url: process.env.TURSO_URL!, authToken: process.env.TURSO_TOKEN })
+const db = drizzle(client)
+const storage = new DrizzleSqliteStorage(db)
+```
+
+### Bun SQLite
+
+```ts
+import { Database } from 'bun:sqlite'
+import { drizzle } from 'drizzle-orm/bun-sqlite'
+import { DrizzleSqliteStorage } from 'serverless-queue'
+
+const db = drizzle(new Database('./queue.db'))
+const storage = new DrizzleSqliteStorage(db)
+```
+
+### better-sqlite3
+
+```ts
+import Database from 'better-sqlite3'
+import { drizzle } from 'drizzle-orm/better-sqlite3'
+import { DrizzleSqliteStorage } from 'serverless-queue'
+
+const db = drizzle(new Database('./queue.db'))
+const storage = new DrizzleSqliteStorage(db)
+```
+
+---
+
+## Custom table name
+
+By default both classes use the exported `pgQueueMessages` / `sqliteQueueMessages` table defined in the schema. To use a different table name, extend the Drizzle schema:
+
+```ts
+import { pgTable, text, bigint } from 'drizzle-orm/pg-core'
+
+const myQueueMessages = pgTable('my_custom_queue', {
+  id: text('id').primaryKey(),
+  queueId: text('queue_id').notNull(),
+  message: text('message').notNull(),
+  timestamp: bigint('timestamp', { mode: 'number' }).notNull(),
+  state: text('state').$type<'pending' | 'processing' | 'done' | 'failed'>().notNull(),
+})
+
+const storage = new DrizzlePgStorage(db, myQueueMessages)
+```
+
+---
+
+## Migration
+
+### MIGRATION_SQL export
+
+The library exports a `MIGRATION_SQL` constant you can run directly:
+
+```ts
+import { MIGRATION_SQL } from 'serverless-queue'
+
+// With node-postgres
+await pool.query(MIGRATION_SQL)
+
+// With better-sqlite3
+db.exec(MIGRATION_SQL)
+
+// With Cloudflare D1
+await env.DB.exec(MIGRATION_SQL)
+```
+
+### Raw SQL
+
+```sql
+CREATE TABLE IF NOT EXISTS queue_messages (
+  id          TEXT    NOT NULL PRIMARY KEY,
+  queue_id    TEXT    NOT NULL,
+  message     TEXT    NOT NULL,
+  timestamp   BIGINT  NOT NULL,
+  state       TEXT    NOT NULL DEFAULT 'pending'
+);
+CREATE INDEX IF NOT EXISTS idx_queue_messages_queue_id_timestamp
+  ON queue_messages (queue_id, timestamp);
+```
+
+> ⚠️ **SQLite note:** Use `INTEGER` instead of `BIGINT` for the `timestamp` column in SQLite.
+
+### Drizzle Kit
+
+Add the queue schema to your `drizzle.config.ts` to manage the table with Drizzle Kit migrations:
+
+```ts
+// drizzle.config.ts
+import type { Config } from 'drizzle-kit'
+
+export default {
+  schema: [
+    './src/db/schema.ts',         // your existing schema
+    './node_modules/serverless-queue/src/drizzle/schema.ts',  // queue schema
+  ],
+  out: './drizzle',
+  dialect: 'postgresql',
+  dbCredentials: { url: process.env.DATABASE_URL! },
+} satisfies Config
+```
+
+Then run:
+
+```bash
+npx drizzle-kit push
+# or generate a migration:
+npx drizzle-kit generate
+npx drizzle-kit migrate
+```
+
+---
+
+## Index requirement
+
+The `idx_queue_messages_queue_id_timestamp` index is **required** for efficient operation. Without it, `readLastMessageByQueue` and `readMessagesByQueue` will full-scan the table on every message.

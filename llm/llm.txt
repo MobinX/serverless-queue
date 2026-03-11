@@ -268,61 +268,83 @@ selfInvoke fire-and-forget explained:
     };
 
 
+=== PRE-BUILT: DrizzleStorage (RECOMMENDED) ===
+
+serverless-queue ships DrizzlePgStorage and DrizzleSqliteStorage — ready to use with any
+Drizzle ORM database instance. No custom storage code needed.
+
+IMPORT:
+  import { DrizzlePgStorage, DrizzleSqliteStorage, pgQueueMessages, sqliteQueueMessages } from 'serverless-queue'
+
+POSTGRES (Neon, Vercel, Supabase, Railway, plain pg):
+  import { neon } from '@neondatabase/serverless'
+  import { drizzle } from 'drizzle-orm/neon-http'
+  const db = drizzle(neon(process.env.DATABASE_URL!))
+  const storage = new DrizzlePgStorage(db)           // uses pgQueueMessages table by default
+  const storage = new DrizzlePgStorage(db, myTable)  // optional custom table
+
+SQLITE (Cloudflare D1, Turso, Bun SQLite, better-sqlite3):
+  // Cloudflare D1:
+  import { drizzle } from 'drizzle-orm/d1'
+  const storage = new DrizzleSqliteStorage(drizzle(env.DB))
+
+  // Bun / better-sqlite3:
+  import { drizzle } from 'drizzle-orm/better-sqlite3'
+  import Database from 'better-sqlite3'
+  const storage = new DrizzleSqliteStorage(drizzle(new Database('./queue.db')))
+
+REQUIRED MIGRATION (run once):
+  import { MIGRATION_SQL } from 'serverless-queue'
+  // or run manually:
+  CREATE TABLE IF NOT EXISTS queue_messages (
+    id TEXT NOT NULL PRIMARY KEY,
+    queue_id TEXT NOT NULL,
+    message TEXT NOT NULL,
+    timestamp BIGINT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'pending'
+  );
+  CREATE INDEX IF NOT EXISTS idx_queue_messages_queue_id_timestamp
+    ON queue_messages (queue_id, timestamp);
+
+DRIZZLE KIT (schema-based migrations):
+  // In drizzle.config.ts, import pgQueueMessages or sqliteQueueMessages from 'serverless-queue'
+  // and include in your schema — then run: npx drizzle-kit push
+
+
+=== PRE-BUILT: SimpleRetryStrategy (RECOMMENDED) ===
+
+import { SimpleRetryStrategy } from 'serverless-queue'
+
+// Always retry (default):
+const strategy = new SimpleRetryStrategy()
+
+// Custom predicate + DLQ:
+const strategy = new SimpleRetryStrategy({
+  shouldRetry: (msg, err) => !(err instanceof ValidationError),
+  onExhausted: async (msg) => {
+    await dlq.push(msg)
+    await slack.send(`Message ${msg.id} exhausted after ${msg.attempt} attempts`)
+  },
+})
+
+
 === WIRING — COMPLETE MINIMAL EXAMPLE ===
 
-This example uses only in-memory implementations. No database required.
-Run it with: bun run example.ts
+Using DrizzlePgStorage + SimpleRetryStrategy (recommended). Requires: drizzle-orm, @neondatabase/serverless.
 
   import {
     MessageQueue,
-    MessageStorage,
     MessageAction,
-    RetryStrategy,
     MessageInvoker,
+    DrizzlePgStorage,
+    SimpleRetryStrategy,
+    pgQueueMessages,
   } from 'serverless-queue';
-  import type {
-    QueueMessage,
-    StoredMessage,
-    MessageState,
-  } from 'serverless-queue';
+  import type { QueueMessage } from 'serverless-queue';
+  import { neon } from '@neondatabase/serverless';
+  import { drizzle } from 'drizzle-orm/neon-http';
 
-  // --- Payload type ---
-  type EmailPayload = { to: string; subject: string; body: string };
-
-  // --- In-memory storage ---
-  class InMemoryStorage extends MessageStorage {
-    private store = new Map<string, StoredMessage>();
-
-    async readMessage(id: string) {
-      return this.store.get(id) ?? null;
-    }
-    async writeMessage(msg: StoredMessage) {
-      if (this.store.has(msg.id)) throw new Error('Duplicate id: ' + msg.id);
-      this.store.set(msg.id, { ...msg });
-    }
-    async updateMessage(msg: StoredMessage) {
-      this.store.set(msg.id, { ...msg });
-    }
-    async deleteMessage(id: string) {
-      this.store.delete(id);
-    }
-    async readLastMessageByQueue(queueId: string) {
-      const msgs = [...this.store.values()]
-        .filter(m => m.queueId === queueId)
-        .sort((a, b) => b.timestamp - a.timestamp);
-      return msgs[0] ?? null;
-    }
-    async readMessagesByQueue(queueId: string, state?: MessageState, limit?: number) {
-      let msgs = [...this.store.values()]
-        .filter(m => m.queueId === queueId && (!state || m.state === state))
-        .sort((a, b) => a.timestamp - b.timestamp);
-      if (limit !== undefined) msgs = msgs.slice(0, limit);
-      return msgs;
-    }
-    async readPendingMessages(queueId: string, limit: number) {
-      return this.readMessagesByQueue(queueId, 'pending', limit);
-    }
-  }
+  type EmailPayload = { to: string; subject: string; html: string };
 
   // --- Action ---
   class SendEmailAction extends MessageAction<EmailPayload> {
@@ -334,46 +356,41 @@ Run it with: bun run example.ts
     }
   }
 
-  // --- Retry strategy ---
-  class SimpleRetryStrategy extends RetryStrategy<EmailPayload> {
-    shouldRetry(_msg: QueueMessage<EmailPayload>, error: unknown): boolean {
-      return error instanceof Error && error.message.includes('network');
-    }
-    async onExhausted(msg: QueueMessage<EmailPayload>) {
-      console.error('Message exhausted after all retries:', msg.id);
-    }
-  }
-
-  // --- Self-invoker (loopback for local use) ---
-  let queue: MessageQueue<EmailPayload>;
-
-  class LoopbackInvoker extends MessageInvoker<EmailPayload> {
-    async invoke(messages: QueueMessage<EmailPayload>[]) {
-      await queue.handle(messages);
+  // --- Self-invoker ---
+  class FetchInvoker extends MessageInvoker {
+    async invoke(messages: QueueMessage[]) {
+      const res = await fetch(`${process.env.QUEUE_URL}/api/queue`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-queue-secret': process.env.QUEUE_SECRET! },
+        body: JSON.stringify(messages),
+      });
+      if (!res.ok) throw new Error(`Self-invoke failed: ${res.status}`);
     }
   }
 
   // --- Wire it up ---
-  queue = new MessageQueue<EmailPayload>(
-    new InMemoryStorage(),
+  const db = drizzle(neon(process.env.DATABASE_URL!));
+
+  const queue = new MessageQueue<EmailPayload>(
+    new DrizzlePgStorage(db, pgQueueMessages),
     new SendEmailAction(),
-    new SimpleRetryStrategy(),
-    new LoopbackInvoker(),
+    new SimpleRetryStrategy({
+      shouldRetry: (_msg, err) => !(err instanceof Error && err.message.includes('validation')),
+      onExhausted: async (msg) => console.error('Exhausted:', msg.id),
+    }),
+    new FetchInvoker(),
     { batchSize: 5, maxAttempts: 3 },
   );
 
   // --- Enqueue a message ---
-  const message: QueueMessage<EmailPayload> = {
+  await queue.handle([{
     id: crypto.randomUUID(),
-    queueId: 'user-123',        // one serial lane per user
-    payload: { to: 'alice@example.com', subject: 'Hello', body: 'Hi Alice!' },
+    queueId: 'user-123',
+    payload: { to: 'alice@example.com', subject: 'Hello', html: '<h1>Hi Alice!</h1>' },
     attempt: 0,
     createdAt: Date.now(),
     type: 'new',
-  };
-
-  await queue.handle([message]);
-  console.log('Done');
+  }]);
 
 
 === DATABASE REQUIREMENTS ===
@@ -1225,15 +1242,97 @@ Full QueueMessage structure you must build:
 
 === PLATFORM: NEXT.JS APP ROUTER ===
 
+3-file integration pattern using DrizzlePgStorage + SimpleRetryStrategy:
+
+-- File 1: lib/queue/action.ts --
+
+  import { MessageAction } from 'serverless-queue'
+  import type { QueueMessage } from 'serverless-queue'
+  import { Resend } from 'resend'
+
+  interface EmailPayload { to: string; subject: string; html: string }
+
+  const resend = new Resend(process.env.RESEND_API_KEY!)
+
+  export class EmailAction extends MessageAction<EmailPayload> {
+    async execute(messages: QueueMessage<EmailPayload>[]) {
+      for (const msg of messages) {
+        await resend.emails.send({ from: 'noreply@yourapp.com', ...msg.payload })
+      }
+    }
+  }
+
+
+-- File 2: lib/queue/index.ts --
+
+  import {
+    MessageQueue, MessageInvoker, SimpleRetryStrategy, DrizzlePgStorage, pgQueueMessages,
+  } from 'serverless-queue'
+  import type { QueueMessage } from 'serverless-queue'
+  import { neon } from '@neondatabase/serverless'
+  import { drizzle } from 'drizzle-orm/neon-http'
+  import { EmailAction } from './action'
+
+  const db = drizzle(neon(process.env.DATABASE_URL!))
+
+  class FetchInvoker extends MessageInvoker {
+    async invoke(messages: QueueMessage[]) {
+      const res = await fetch(`${process.env.NEXT_PUBLIC_APP_URL}/api/queue`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-queue-secret': process.env.QUEUE_SECRET! },
+        body: JSON.stringify(messages),
+      })
+      if (!res.ok) throw new Error(`Invoke failed: ${res.status}`)
+    }
+  }
+
+  export const queue = new MessageQueue(
+    new DrizzlePgStorage(db, pgQueueMessages),
+    new EmailAction(),
+    new SimpleRetryStrategy({
+      shouldRetry: (_msg, err) => !(err instanceof Error && err.message.includes('validation')),
+      onExhausted: async (msg) => console.error('[queue] exhausted', msg.id),
+    }),
+    new FetchInvoker(),
+    { batchSize: 10, maxAttempts: 3, drainMode: 'individual' },
+  )
+
+  export async function enqueue(payload: { to: string; subject: string; html: string }) {
+    await queue.handle([{
+      id: crypto.randomUUID(),
+      queueId: 'email',
+      payload,
+      attempt: 0,
+      createdAt: Date.now(),
+      type: 'new',
+    }])
+  }
+
+
+-- File 3: app/api/queue/route.ts --
+
+  import { queue } from '@/lib/queue'
+  import type { QueueMessage } from 'serverless-queue'
+  import { NextRequest, NextResponse } from 'next/server'
+
+  export async function POST(req: NextRequest) {
+    if (req.headers.get('x-queue-secret') !== process.env.QUEUE_SECRET) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+    }
+    const messages = await req.json() as QueueMessage[]
+    await queue.handle(messages)
+    return NextResponse.json({ ok: true })
+  }
+
+
 -- SQL migration --
 
-  -- migrations/001_create_queue_messages.sql
   CREATE TABLE IF NOT EXISTS queue_messages (
     id         TEXT        NOT NULL PRIMARY KEY,
     queue_id   TEXT        NOT NULL,
     message    TEXT        NOT NULL,
     timestamp  BIGINT      NOT NULL,
-    state      TEXT        NOT NULL
+    state      TEXT        NOT NULL DEFAULT 'pending'
   );
   CREATE INDEX IF NOT EXISTS idx_queue_messages_queue_id_timestamp
     ON queue_messages (queue_id, timestamp);
@@ -1241,37 +1340,10 @@ Full QueueMessage structure you must build:
 
 -- Environment variables --
 
-  QUEUE_URL=https://yourapp.com/api/queue
+  DATABASE_URL=postgres://...
   QUEUE_SECRET=your-secret-token
-  DATABASE_URL=postgres://user:password@host:5432/dbname
-
-
--- lib/queue/index.ts (singleton) --
-
-  import { MessageQueue } from 'serverless-queue';
-  import { FetchInvoker } from '@/lib/queue/FetchInvoker';
-  import { PostgresStorage } from '@/lib/queue/PostgresStorage';
-  import { SendEmailAction } from '@/lib/queue/SendEmailAction';
-  import { SimpleRetryStrategy } from '@/lib/queue/SimpleRetryStrategy';
-  import { pool } from '@/lib/db';
-
-  type MyPayload = { to: string; subject: string; html: string };
-
-  // Instantiate once — Next.js module cache keeps this alive across requests.
-  export const queue = new MessageQueue<MyPayload>(
-    new PostgresStorage(pool),
-    new SendEmailAction(process.env.RESEND_API_KEY!),
-    new SimpleRetryStrategy(),
-    new FetchInvoker(
-      process.env.QUEUE_URL!,
-      process.env.QUEUE_SECRET,
-    ),
-    {
-      batchSize: 5,
-      maxAttempts: 3,
-      invokeRetries: 3,
-    },
-  );
+  NEXT_PUBLIC_APP_URL=https://yourapp.com
+  RESEND_API_KEY=re_...
 
 
 -- app/api/queue/route.ts --
